@@ -1,0 +1,9 @@
+slack-bolt
+flask
+openai
+google-auth
+google-auth-oauthlib
+google-api-python-client
+python-docx
+python-dotenv
+requests
