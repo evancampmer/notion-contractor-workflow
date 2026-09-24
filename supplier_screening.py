@@ -367,6 +367,8 @@ handler = SlackRequestHandler(slack_app)
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
+    logging.info(f"Incoming request headers: {dict(request.headers)}")
+    logging.info(f"Incoming request body: {request.get_data(as_text=True)[:500]}")
     return handler.handle(request)
 
 
