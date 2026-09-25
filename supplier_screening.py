@@ -5,8 +5,10 @@ import json
 import logging
 import tempfile
 import threading
+import time
 from datetime import datetime
 
+import numpy as np
 import requests
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -57,6 +59,9 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 OUTPUT_FOLDER = "output_docs"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+TOP_K = 20          # profiles to retrieve via vector search before scoring
+PROFILE_CHARS = 3000  # max chars per profile sent to the scoring LLM
+
 # =========================
 # PROMPTS
 # =========================
@@ -78,9 +83,9 @@ Rules:
 - Evidence standard: specific words/phrases to look for in a profile
 - No commentary, no headers, no explanation outside these two items"""
 
-BATCH_SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
+SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
 
-Score EVERY supplier profile in this batch against the criteria. Return ONLY a pipe-delimited table — no other text, no preamble, no commentary.
+Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited table — no other text, no preamble, no commentary.
 
 Table columns (use exactly these headers):
 | Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary |
@@ -90,13 +95,13 @@ Scoring rules:
 - Multiply each score by its importance weight, sum all weighted scores, normalize to 100
 - Technical subtotal and Contextual subtotal each normalized to 100 independently
 - "Each Criterion Score": inline list using the short criterion names from the criteria table, e.g. "510k sub 5; FDA reg 4; Tech writing 2"
-- Score ALL suppliers in this batch; give 0 if no relevant evidence exists
+- Score ALL suppliers; give 0 if no relevant evidence exists
 - Sort by Total Score descending
 - Each cell: 1-2 sentences max"""
 
 SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing final candidate scores.
 
-You will receive the top-scored candidates after all batches have been scored. Write exactly three sections:
+You will receive the top-scored candidates. Write exactly three sections:
 
 SECTION 1 — HEADLINE
 One sentence: overall finding (e.g. "Three strong candidates identified; no exact FDA regulatory specialist found in database")
@@ -114,12 +119,9 @@ No other text outside these three sections."""
 # =========================
 
 def get_supplier_docs():
-    """Download all DOCX files from the Google Drive folder and extract text.
-    Uses AuthorizedSession (requests-based) to avoid httplib2 SSL issues on Python 3.13.
-    """
+    """Download all DOCX files from the Google Drive folder and extract text."""
     supplier_docs = []
 
-    # List files
     list_resp = drive_session.get(
         "https://www.googleapis.com/drive/v3/files",
         params={
@@ -167,6 +169,128 @@ def get_supplier_docs():
 
 
 # =========================
+# VECTOR INDEX
+# =========================
+
+EMBEDDINGS_FILENAME = "supplier_embeddings.json"
+REFRESH_SECRET = os.getenv("REFRESH_SECRET", "")
+
+_supplier_index = None   # {"docs": list, "vectors": np.ndarray}
+_index_lock = threading.Lock()
+_index_ready = threading.Event()
+_embed_model = None
+_embed_lock = threading.Lock()
+
+
+def _get_embed_model():
+    """Lazy-load the fastembed model (thread-safe)."""
+    global _embed_model
+    if _embed_model is None:
+        with _embed_lock:
+            if _embed_model is None:
+                from fastembed import TextEmbedding
+                logging.info("Loading fastembed model (BAAI/bge-small-en-v1.5)...")
+                _embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+                logging.info("Embedding model loaded")
+    return _embed_model
+
+
+def _find_drive_file_id(filename):
+    """Return the Drive file ID for a file in the supplier folder, or None."""
+    resp = drive_session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={
+            "q": f"name='{filename}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false",
+            "fields": "files(id)",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "corpora": "allDrives",
+        }
+    )
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _load_embeddings_from_drive():
+    """Load pre-computed embeddings JSON from Drive. Returns index dict or None."""
+    try:
+        file_id = _find_drive_file_id(EMBEDDINGS_FILENAME)
+        if not file_id:
+            return None
+        dl = drive_session.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            params={"alt": "media", "supportsAllDrives": "true"}
+        )
+        dl.raise_for_status()
+        data = dl.json()
+        profiles = data.get("profiles", [])
+        if not profiles:
+            return None
+        docs = [{"name": p["name"], "text": p["text"]} for p in profiles]
+        vectors = np.array([p["vector"] for p in profiles], dtype=np.float32)
+        logging.info(f"Loaded {len(docs)} pre-computed embeddings from Drive (version {data.get('version', 'unknown')})")
+        return {"docs": docs, "vectors": vectors}
+    except Exception as e:
+        logging.warning(f"Could not load embeddings from Drive: {e}")
+        return None
+
+
+def _build_index_from_scratch():
+    """Compute embeddings from Drive DOCXs. Fallback when no pre-computed JSON exists."""
+    docs = get_supplier_docs()
+    if not docs:
+        return None
+    model = _get_embed_model()
+    texts = [d["text"][:PROFILE_CHARS] for d in docs]
+    logging.info(f"Computing embeddings for {len(docs)} profiles (first-time setup)...")
+    vectors = np.array(list(model.embed(texts)), dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    vectors = vectors / np.maximum(norms, 1e-10)
+    logging.info(f"Embeddings computed for {len(docs)} profiles")
+    return {"docs": docs, "vectors": vectors}
+
+
+def _build_index():
+    """Build the in-memory index on startup. Tries Drive JSON first, falls back to computing."""
+    global _supplier_index
+    try:
+        index = _load_embeddings_from_drive()
+        if index is None:
+            logging.warning("No pre-computed embeddings found — computing from scratch (this takes ~60s)")
+            index = _build_index_from_scratch()
+        if index:
+            with _index_lock:
+                _supplier_index = index
+            logging.info(f"Vector index ready: {len(index['docs'])} profiles")
+        else:
+            logging.error("Index build produced no results")
+    except Exception as e:
+        logging.error(f"Index build failed: {e}", exc_info=True)
+    finally:
+        _index_ready.set()
+
+
+def retrieve_top_k(query_text, k=TOP_K):
+    """Return the k most semantically similar supplier profiles to the query."""
+    model = _get_embed_model()
+    q_vec = np.array(list(model.embed([query_text]))[0], dtype=np.float32)
+    q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
+
+    with _index_lock:
+        index = _supplier_index
+
+    scores = index["vectors"] @ q_vec
+    top_indices = np.argsort(scores)[::-1][:k]
+    top_docs = [index["docs"][i] for i in top_indices]
+    logging.info(f"Vector search: top {len(top_docs)} profiles (scores {scores[top_indices[0]]:.3f} — {scores[top_indices[-1]]:.3f})")
+    return top_docs
+
+
+# Start building the index in the background immediately on startup
+threading.Thread(target=_build_index, daemon=True).start()
+
+
+# =========================
 # TEXT HELPERS
 # =========================
 
@@ -190,11 +314,22 @@ def _parse_md_table(text):
         if not line.startswith("|"):
             continue
         if re.match(r"^\|[-|:\s]+\|$", line):
-            continue  # separator row
+            continue
         cells = [_strip_md(c.strip()) for c in line.strip("|").split("|")]
         if any(cells):
             rows.append(cells)
     return rows
+
+
+def _extract_score(row):
+    try:
+        return int(re.search(r"\d+", row[1]).group())
+    except Exception:
+        return 0
+
+
+def _is_header_row(row):
+    return any(h in row[0].lower() for h in ["name", "rank", "supplier"])
 
 
 # =========================
@@ -208,94 +343,75 @@ def create_supplier_criteria(message_text):
         max_tokens=1000,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                "Create the screening criteria for this project brief:\n\n"
-                f"{message_text}"
-            )}
+            {"role": "user", "content": f"Create the screening criteria for this project brief:\n\n{message_text}"}
         ]
     )
     return response.choices[0].message.content
 
 
-BATCH_SIZE = 30
-
-def _score_batch(criteria, batch_docs):
-    """Score one batch of supplier docs and return the parsed table rows."""
+def score_suppliers(criteria, supplier_docs):
+    """Score the pre-filtered supplier docs in a single LLM call."""
     supplier_text = "\n\n---\n\n".join(
-        f"SUPPLIER: {doc['name']}\n\n{doc['text']}"
-        for doc in batch_docs
+        f"SUPPLIER: {doc['name']}\n\n{doc['text'][:PROFILE_CHARS]}"
+        for doc in supplier_docs
     )
+    logging.info(f"Scoring {len(supplier_docs)} profiles in one call...")
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=8000,
+        max_tokens=6000,
         messages=[
-            {"role": "system", "content": BATCH_SCORING_PROMPT},
+            {"role": "system", "content": SCORING_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
         ]
     )
     return response.choices[0].message.content
 
 
-def _extract_score(row):
-    """Parse the Total Score from a table row (column index 1)."""
-    try:
-        return int(re.search(r"\d+", row[1]).group())
-    except Exception:
-        return 0
-
-
-def _is_header_row(row):
-    """Detect if a row is a header (not a data row)."""
-    return any(h in row[0].lower() for h in ["name", "rank", "supplier"])
-
-
-def rank_suppliers(criteria, supplier_docs):
-    """Score all suppliers in batches, merge results, return top candidates + synthesis."""
-    batches = [supplier_docs[i:i+BATCH_SIZE] for i in range(0, len(supplier_docs), BATCH_SIZE)]
-    logging.info(f"Scoring {len(supplier_docs)} suppliers across {len(batches)} batches of up to {BATCH_SIZE}")
-
-    header_row = None
-    all_data_rows = []
-
-    for idx, batch in enumerate(batches):
-        logging.info(f"Batch {idx+1}/{len(batches)}: scoring {len(batch)} suppliers...")
-        batch_text = _score_batch(criteria, batch)
-        rows = _parse_md_table(batch_text)
-
-        if not rows:
-            logging.warning(f"Batch {idx+1} returned no parseable rows")
-            continue
-
-        for row in rows:
-            if _is_header_row(row):
-                if header_row is None:
-                    header_row = row
-            else:
-                all_data_rows.append(row)
-
-    # Sort all candidates by Total Score, take top 15
-    all_data_rows.sort(key=_extract_score, reverse=True)
-    top_rows = all_data_rows[:15]
-    logging.info(f"Merged {len(all_data_rows)} scored candidates, kept top {len(top_rows)}")
-
-    # Build synthesis (headline + scoring method + recommendation) from top results
+def synthesize(criteria, top_rows):
+    """Run synthesis pass over top-scored candidates."""
     top_summary = "\n".join(
-        f"{row[0]}: Total {row[1]}, Tech {row[2] if len(row) > 2 else 'N/A'}, "
+        f"{row[0]}: Total {row[1]}, "
+        f"Tech {row[2] if len(row) > 2 else 'N/A'}, "
         f"Contextual {row[3] if len(row) > 3 else 'N/A'}, "
-        f"Criteria scores: {row[4] if len(row) > 4 else 'N/A'}, "
         f"Strengths: {row[5] if len(row) > 5 else 'N/A'}"
         for row in top_rows
     )
-
-    synthesis_response = openrouter.chat.completions.create(
+    response = openrouter.chat.completions.create(
         model=MODEL,
         max_tokens=2000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
-            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nTOP CANDIDATES (pre-scored):\n{top_summary}"}
+            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nTOP CANDIDATES:\n{top_summary}"}
         ]
     )
-    synthesis = synthesis_response.choices[0].message.content
+    return response.choices[0].message.content
+
+
+def rank_suppliers(criteria, supplier_docs):
+    """Full pipeline: score docs, sort, synthesize, return structured result."""
+    raw = score_suppliers(criteria, supplier_docs)
+    rows = _parse_md_table(raw)
+
+    header_row = None
+    data_rows = []
+    for row in rows:
+        if _is_header_row(row):
+            if header_row is None:
+                header_row = row
+        else:
+            data_rows.append(row)
+
+    data_rows.sort(key=_extract_score, reverse=True)
+
+    # Keep candidates scoring >= 70, but always include at least top 3
+    MIN_SCORE = 70
+    qualified = [r for r in data_rows if _extract_score(r) >= MIN_SCORE]
+    if len(qualified) < 3:
+        qualified = data_rows[:3]  # fallback: top 3 regardless of score
+    top_rows = qualified[:15]
+    logging.info(f"Scored {len(data_rows)} candidates: {len(qualified)} scored >= {MIN_SCORE}, kept {len(top_rows)}")
+
+    synthesis = synthesize(criteria, top_rows)
     logging.info("Synthesis complete")
 
     return {
@@ -310,14 +426,12 @@ def rank_suppliers(criteria, supplier_docs):
 # =========================
 
 def _add_table_to_doc(doc, rows):
-    """Add a parsed markdown table to a python-docx Document."""
     if not rows:
         return
     num_cols = len(rows[0])
     table = doc.add_table(rows=len(rows), cols=num_cols)
     table.style = "Table Grid"
     for r_idx, row in enumerate(rows):
-        # Pad/trim to expected column count
         while len(row) < num_cols:
             row.append("")
         row = row[:num_cols]
@@ -332,13 +446,9 @@ def _add_table_to_doc(doc, rows):
 
 
 def _parse_rankings(rankings_text):
-    """Split the AI screening output into its four sections.
-    Handles varied formatting: plain, bold (**SECTION 1**), markdown headers (## SECTION 1), etc.
-    """
     sections = {1: [], 2: [], 3: [], 4: []}
     current = None
     for line in rankings_text.split("\n"):
-        # Strip markdown bold/header markers before checking for section labels
         clean = re.sub(r"[#\*\_]+", "", line).strip()
         if re.search(r"SECTION\s*1", clean, re.IGNORECASE):
             current = 1; continue
@@ -354,29 +464,15 @@ def _parse_rankings(rankings_text):
 
 
 def generate_recommendations_docx(criteria, rankings, original_message):
-    """Build the output DOCX matching Cassidy's style.
-
-    `rankings` is a dict returned by rank_suppliers():
-        {
-            "synthesis": <str — the 3-section AI synthesis>,
-            "header_row": <list — column headers from batch scoring>,
-            "ranked_rows": <list of lists — top-15 candidate rows>,
-        }
-    """
     doc = Document()
 
-    # Derive a short title from the first non-empty line of the message
     title_line = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
     if len(title_line) > 80:
         title_line = title_line[:77] + "..."
 
-    # Main heading — matches Cassidy's style exactly
     doc.add_heading(f"Supplier screening results — {title_line}", level=2)
-
-    # ── Scoring method ──────────────────────────────────────────
     doc.add_heading("Scoring method", level=3)
 
-    # Criteria summary (prose before the pipe table)
     criteria_lines = criteria.split("\n")
     summary_parts, table_lines = [], []
     in_table = False
@@ -389,25 +485,19 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     if summary_text:
         doc.add_paragraph(summary_text)
 
-    # Criteria table
     criteria_rows = _parse_md_table("\n".join(table_lines))
     if criteria_rows:
         _add_table_to_doc(doc, criteria_rows)
 
-    # Parse synthesis into sections 1-3
     synthesis_text = rankings.get("synthesis", "")
     sections = _parse_rankings(synthesis_text)
-    logging.info(f"Parsed synthesis sections — lengths: { {k: len(v) for k, v in sections.items()} }")
+    logging.info(f"Synthesis sections lengths: { {k: len(v) for k, v in sections.items()} }")
 
-    # Section 1 — headline (brief overall finding paragraph)
     if sections[1]:
         doc.add_paragraph(_strip_md(sections[1]))
-
-    # Section 2 — scoring method prose
     if sections[2]:
         doc.add_paragraph(_strip_md(sections[2]))
 
-    # ── Recommendation ──────────────────────────────────────────
     doc.add_heading("Recommendation", level=3)
     for line in sections[3].split("\n"):
         s = line.strip()
@@ -419,7 +509,6 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         else:
             doc.add_paragraph(_strip_md(s))
 
-    # ── Ranked candidate table (from merged batch results) ───────
     header_row = rankings.get("header_row")
     ranked_rows = rankings.get("ranked_rows", [])
     if header_row and ranked_rows:
@@ -441,7 +530,23 @@ def process_message(message_text, channel_id, thread_ts, client):
         criteria = create_supplier_criteria(message_text)
         logging.info("Criteria created")
 
-        supplier_docs = get_supplier_docs()
+        # Wait up to 3 min for the vector index (only matters on first boot)
+        if not _index_ready.is_set():
+            logging.info("Waiting for supplier index to finish loading...")
+            client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts,
+                text="Still loading the supplier database — first run takes an extra minute. Hang tight! 🔄"
+            )
+            _index_ready.wait(timeout=180)
+
+        if _supplier_index and len(_supplier_index["docs"]) > 0:
+            # Vector retrieval: combine brief + criteria for best semantic match
+            query = f"{message_text}\n\n{criteria}"
+            supplier_docs = retrieve_top_k(query, k=TOP_K)
+        else:
+            # Fallback: score all docs the slow way
+            logging.warning("Vector index unavailable — falling back to full scan")
+            supplier_docs = get_supplier_docs()
 
         if not supplier_docs:
             client.chat_postMessage(
@@ -460,7 +565,7 @@ def process_message(message_text, channel_id, thread_ts, client):
             thread_ts=thread_ts,
             file=docx_path,
             filename="Supplier_Recommendations.docx",
-            initial_comment="Here are your supplier recommendations! 📋"
+            initial_comment="Here are your supplier recommendations! Searched all profiles, scored the best matches. 📋"
         )
 
         logging.info("Supplier recommendations sent to Slack")
@@ -524,7 +629,36 @@ def slack_events():
 
 @flask_app.route("/health", methods=["GET"])
 def health():
-    return "OK", 200
+    index_status = "ready" if (_supplier_index and len(_supplier_index["docs"]) > 0) else "loading"
+    count = len(_supplier_index["docs"]) if _supplier_index else 0
+    return {"status": "ok", "index": index_status, "profiles": count}, 200
+
+
+@flask_app.route("/refresh-index", methods=["POST"])
+def refresh_index():
+    """Called by the Notion pipeline after uploading new DOCXs.
+    Reloads the pre-computed embeddings JSON from Drive into memory.
+    Requires Authorization: Bearer <REFRESH_SECRET> header.
+    """
+    auth = request.headers.get("Authorization", "")
+    if REFRESH_SECRET and auth != f"Bearer {REFRESH_SECRET}":
+        return {"error": "Unauthorized"}, 401
+
+    def _refresh():
+        global _supplier_index
+        try:
+            index = _load_embeddings_from_drive()
+            if index:
+                with _index_lock:
+                    _supplier_index = index
+                logging.info(f"Index refreshed: {len(index['docs'])} profiles loaded from Drive")
+            else:
+                logging.warning("Refresh called but no embeddings file found in Drive")
+        except Exception as e:
+            logging.error(f"Index refresh failed: {e}", exc_info=True)
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return {"status": "refreshing"}, 202
 
 
 if __name__ == "__main__":

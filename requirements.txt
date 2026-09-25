@@ -4,9 +4,10 @@ gunicorn
 openai
 google-auth
 google-auth-oauthlib
+google-auth-httplib2
 google-api-python-client
 python-docx
-fpdf2
 python-dotenv
 requests
-beautifulsoup4
+numpy
+fastembed
