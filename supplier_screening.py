@@ -14,7 +14,7 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
 from openai import OpenAI
 from docx import Document
-from fpdf import FPDF
+from docx.shared import Pt, RGBColor
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -171,29 +171,30 @@ def get_supplier_docs():
 # =========================
 
 def strip_mention(text):
-    """Remove Slack @mention tags like <@U0C407F3AKT> from the message."""
-    return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+    “””Remove Slack @mention tags like <@U0C407F3AKT> from the message.”””
+    return re.sub(r”<@[A-Z0-9]+>\s*”, “”, text).strip()
 
 
-def _safe(text):
-    """Sanitize text for fpdf latin-1 core fonts."""
-    replacements = {
-        "•": "-", "’": "'", "‘": "'",
-        "“": '"', "”": '"', "–": "-",
-        "—": "--", "…": "...", "→": "->",
-        "✓": "v", "✔": "v", "✘": "x",
-        "é": "e", "ó": "o", "á": "a",
-    }
-    for ch, rep in replacements.items():
-        text = text.replace(ch, rep)
-    # Strip remaining bold/italic markers
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    return text.encode("latin-1", errors="replace").decode("latin-1")
+def _strip_md(text):
+    “””Strip markdown bold/italic markers.”””
+    text = re.sub(r”\*\*(.+?)\*\*”, r”\1”, text)
+    text = re.sub(r”\*(.+?)\*”, r”\1”, text)
+    return text.strip()
 
 
-def _strip_bold(text):
-    return re.sub(r"\*\*(.+?)\*\*", r"\1", re.sub(r"\*(.+?)\*", r"\1", text))
+def _parse_md_table(text):
+    “””Extract rows from a markdown pipe-delimited table.”””
+    rows = []
+    for line in text.split(“\n”):
+        line = line.strip()
+        if not line.startswith(“|”):
+            continue
+        if re.match(r”^\|[-|:\s]+\|$”, line):
+            continue  # separator row
+        cells = [_strip_md(c.strip()) for c in line.strip(“|”).split(“|”)]
+        if any(cells):
+            rows.append(cells)
+    return rows
 
 
 # =========================
@@ -235,164 +236,106 @@ def rank_suppliers(criteria, supplier_docs):
 
 
 # =========================
-# PDF GENERATION
+# DOCX GENERATION
 # =========================
 
-def _parse_table(lines):
-    """Parse markdown table lines into a list of row lists."""
-    rows = []
-    for line in lines:
-        if re.match(r"^\s*\|[-|:\s]+\|\s*$", line):
-            continue  # separator row
-        cells = [_safe(_strip_bold(c.strip())) for c in line.strip().strip("|").split("|")]
-        if any(cells):
-            rows.append(cells)
-    return rows
-
-
-def _render_table(pdf, rows):
-    """Render a table with shaded header row."""
+def _add_table_to_doc(doc, rows):
+    """Add a parsed markdown table to a python-docx Document."""
     if not rows:
         return
     num_cols = len(rows[0])
-    page_w = pdf.w - pdf.l_margin - pdf.r_margin
-    col_w = page_w / num_cols
-    font_size = 8 if num_cols > 5 else 9
-
+    table = doc.add_table(rows=len(rows), cols=num_cols)
+    table.style = "Table Grid"
     for r_idx, row in enumerate(rows):
-        # Pad/trim row to expected columns
+        # Pad/trim to expected column count
         while len(row) < num_cols:
             row.append("")
         row = row[:num_cols]
-
-        # Measure tallest cell in this row
-        pdf.set_font("Helvetica", "B" if r_idx == 0 else "", font_size)
-        cell_heights = []
-        for cell in row:
-            lines_needed = max(1, len(cell) // max(1, int(col_w / (font_size * 0.5))) + 1)
-            cell_heights.append(lines_needed * (font_size * 0.5 + 1))
-        row_h = max(cell_heights)
-        row_h = max(row_h, font_size + 2)
-
-        # Page break check
-        if pdf.get_y() + row_h > pdf.h - pdf.b_margin - 10:
-            pdf.add_page()
-
-        y0 = pdf.get_y()
-        if r_idx == 0:
-            pdf.set_fill_color(210, 210, 210)
-        elif r_idx % 2 == 0:
-            pdf.set_fill_color(245, 245, 245)
-        else:
-            pdf.set_fill_color(255, 255, 255)
-
-        for c_idx, cell in enumerate(row):
-            pdf.set_xy(pdf.l_margin + c_idx * col_w, y0)
-            pdf.set_font("Helvetica", "B" if r_idx == 0 else "", font_size)
-            pdf.multi_cell(col_w, font_size + 2, cell, border=1,
-                           fill=True, max_line_height=font_size + 1)
-
-        pdf.set_y(y0 + row_h)
-
-    pdf.ln(4)
+        for c_idx, cell_text in enumerate(row):
+            cell = table.cell(r_idx, c_idx)
+            cell.text = cell_text
+            para = cell.paragraphs[0]
+            if r_idx == 0:
+                for run in para.runs:
+                    run.bold = True
+    doc.add_paragraph()
 
 
-def render_markdown(pdf, text):
-    """Render markdown text into the PDF with proper formatting."""
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+def _parse_rankings(rankings_text):
+    """Split the AI screening output into its four sections."""
+    sections = {1: [], 2: [], 3: [], 4: []}
+    current = None
+    for line in rankings_text.split("\n"):
+        s = line.strip()
+        if re.match(r"SECTION\s*1", s, re.IGNORECASE):
+            current = 1; continue
+        if re.match(r"SECTION\s*2", s, re.IGNORECASE):
+            current = 2; continue
+        if re.match(r"SECTION\s*3", s, re.IGNORECASE):
+            current = 3; continue
+        if re.match(r"SECTION\s*4", s, re.IGNORECASE):
+            current = 4; continue
+        if current:
+            sections[current].append(line)
+    return {k: "\n".join(v).strip() for k, v in sections.items()}
 
-        # Collect table block
-        if "|" in stripped and i + 1 < len(lines) and re.match(r"^\s*\|[-|:\s]+\|\s*$", lines[i + 1]):
-            table_lines = []
-            while i < len(lines) and "|" in lines[i]:
-                table_lines.append(lines[i])
-                i += 1
-            _render_table(pdf, _parse_table(table_lines))
+
+def generate_recommendations_docx(criteria, rankings, original_message):
+    doc = Document()
+
+    # Derive a short title from the first non-empty line of the message
+    title_line = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
+    if len(title_line) > 80:
+        title_line = title_line[:77] + "..."
+
+    # Main heading — matches Cassidy's style exactly
+    doc.add_heading(f"Supplier screening results — {title_line}", level=2)
+
+    # ── Scoring method ──────────────────────────────────────────
+    doc.add_heading("Scoring method", level=3)
+
+    # Criteria summary (text before the table)
+    criteria_lines = criteria.split("\n")
+    summary_parts, table_lines = [], []
+    in_table = False
+    for line in criteria_lines:
+        if "|" in line:
+            in_table = True
+        (table_lines if in_table else summary_parts).append(line)
+
+    summary_text = " ".join(l.strip() for l in summary_parts if l.strip())
+    if summary_text:
+        doc.add_paragraph(summary_text)
+
+    # Criteria table
+    criteria_rows = _parse_md_table("\n".join(table_lines))
+    if criteria_rows:
+        _add_table_to_doc(doc, criteria_rows)
+
+    # Scoring method paragraph from rankings section 2
+    sections = _parse_rankings(rankings)
+    if sections[2]:
+        doc.add_paragraph(sections[2])
+
+    # ── Recommendation ──────────────────────────────────────────
+    doc.add_heading("Recommendation", level=3)
+    for line in sections[3].split("\n"):
+        s = line.strip()
+        if not s:
             continue
-
-        # Headings
-        if stripped.startswith("### "):
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.multi_cell(0, 6, _safe(stripped[4:]))
-            pdf.ln(1)
-        elif stripped.startswith("## "):
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.multi_cell(0, 7, _safe(stripped[3:]))
-            pdf.ln(1)
-        elif stripped.startswith("# "):
-            pdf.set_font("Helvetica", "B", 13)
-            pdf.multi_cell(0, 8, _safe(stripped[2:]))
-            pdf.ln(1)
-        # Horizontal rule
-        elif re.match(r"^---+$", stripped):
-            pdf.set_draw_color(180, 180, 180)
-            pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
-            pdf.set_draw_color(0, 0, 0)
-            pdf.ln(3)
-        # Bullet
-        elif re.match(r"^[\*\-]\s", stripped):
-            content = _safe(_strip_bold(re.sub(r"^[\*\-]\s+", "", stripped)))
-            pdf.set_font("Helvetica", "", 10)
-            pdf.set_x(pdf.l_margin + 5)
-            pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - 5, 5, "- " + content)
-        # Numbered list
-        elif re.match(r"^\d+\.\s", stripped):
-            content = _safe(_strip_bold(re.sub(r"^\d+\.\s+", "", stripped)))
-            num = re.match(r"^(\d+)\.", stripped).group(1)
-            pdf.set_font("Helvetica", "", 10)
-            pdf.set_x(pdf.l_margin + 5)
-            pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - 5, 5, f"{num}. {content}")
-        # Empty line
-        elif stripped == "":
-            pdf.ln(3)
-        # Regular text
+        if re.match(r"^[\*\-]\s", s):
+            content = _strip_md(re.sub(r"^[\*\-]\s+", "", s))
+            doc.add_paragraph(content, style="List Paragraph")
         else:
-            pdf.set_font("Helvetica", "", 10)
-            pdf.multi_cell(0, 5, _safe(_strip_bold(stripped)))
+            doc.add_paragraph(_strip_md(s))
 
-        i += 1
+    # ── Ranked table ────────────────────────────────────────────
+    ranked_rows = _parse_md_table(sections[4])
+    if ranked_rows:
+        _add_table_to_doc(doc, ranked_rows)
 
-
-def generate_recommendations_pdf(criteria, rankings, original_message):
-    pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # Title
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "Supplier Recommendations", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(4)
-
-    # Project Brief
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "Project Brief", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 5, _safe(original_message))
-    pdf.ln(6)
-
-    # Criteria
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "Screening Criteria", new_x="LMARGIN", new_y="NEXT")
-    render_markdown(pdf, criteria)
-    pdf.ln(4)
-
-    # Rankings
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "Supplier Screening Results", new_x="LMARGIN", new_y="NEXT")
-    render_markdown(pdf, rankings)
-
-    filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.pdf")
-    pdf.output(filename)
+    filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.docx")
+    doc.save(filename)
     return filename
 
 
@@ -417,13 +360,13 @@ def process_message(message_text, channel_id, thread_ts, client):
         rankings = rank_suppliers(criteria, supplier_docs)
         logging.info("Rankings complete")
 
-        pdf_path = generate_recommendations_pdf(criteria, rankings, message_text)
+        docx_path = generate_recommendations_docx(criteria, rankings, message_text)
 
         client.files_upload_v2(
             channel=channel_id,
             thread_ts=thread_ts,
-            file=pdf_path,
-            filename="Supplier_Recommendations.pdf",
+            file=docx_path,
+            filename="Supplier_Recommendations.docx",
             initial_comment="Here are your supplier recommendations! 📋"
         )
 
