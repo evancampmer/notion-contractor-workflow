@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "gunicorn supplier_screening:flask_app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --worker-class gthread --timeout 120"
+startCommand = "gunicorn supplier_screening:flask_app --bind 0.0.0.0:8080 --workers 1 --threads 4 --worker-class gthread --timeout 120"
