@@ -1,11 +1,12 @@
 import os
 import io
+import re
 import json
 import logging
 import tempfile
 import threading
 from datetime import datetime
- 
+
 import requests
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -17,140 +18,110 @@ from fpdf import FPDF
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
- 
+
 # =========================
 # CONFIG + LOGGING
 # =========================
- 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
- 
+
 load_dotenv()
- 
+
 # =========================
 # CLIENTS
 # =========================
- 
-# Slack
+
 slack_app = App(
     token=os.getenv("SLACK_BOT_TOKEN"),
     signing_secret=os.getenv("SLACK_SIGNING_SECRET")
 )
- 
-# OpenRouter
+
 openrouter = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY_ALINA")
+    api_key=os.getenv("OPENROUTER_API_KEY")
 )
- 
+
 MODEL = "anthropic/claude-sonnet-4-5"
- 
-# Google Drive
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 service_account_info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info, scopes=SCOPES
 )
 drive_service = build("drive", "v3", credentials=credentials)
- 
+
 SLACK_CHANNEL_ID = "C0C2QRTGAUV"
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 OUTPUT_FOLDER = "output_docs"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
- 
+
 # =========================
 # PROMPTS
 # =========================
- 
-CRITERIA_SYSTEM_PROMPT = """Role:
-You are a business analyst in charge of converting consulting project descriptions into requirements.
- 
-Context:
-You are helping a consulting and staffing firm find the best profiles within their supplier database to fill the need for a specific project. You will be receiving information from a business user with project description info (could be one line or an interview transcript). You will need to sort through this to identify 1) what is required in a consultant who will support the project (specific credentials, experiences, or qualities), 2) a specific rubric that will allow another agent to identify the right people based on the criteria you create.
-Also all components of the query whether it's a short sentence or a long interview transcript are integral parts to the criteria process. If it's said explicitly that the criteria is there or if it's implied with the certain wording it uses.
- 
-## Your Task
-Analyze the project description and extract comprehensive evaluation criteria in THREE categories:
-### 1. Core Technical Requirements
-Skills, tools, certifications explicitly mentioned or directly implied.
-Assign importance (1-5) based on how critical each is.
-### 2. Contextual Fit Requirements
-Extract these by analyzing:
-- Company type/stage: What does "early-stage VC" tell you about work environment?
-- Industry domain: Does industry experience matter?
-- Implicit work style: What does this role actually need day-to-day?
-Create scorable criteria like:
-- "Startup or VC experience"
-- "Entrepreneurial/generalist mindset"
-- "Comfort with ambiguity and rapid change"
-Assign importance (1-5) - these should be AS IMPORTANT as technical skills.
-### 3. Adjacent/Complementary Skills
-What would make someone even better, based on the context?
-## Output Format
-For EACH criterion across all three groups, output:
-- Criterion name
-- Importance (1-5)
-- Brief rationale
-Make contextual criteria just as concrete and scorable as technical ones.
- 
-Output:
-You will create summary output with a 1-3 sentence summary of the project and a table with the information above."""
- 
-SCREENING_SYSTEM_PROMPT = """Role:
-You are a supplier screening agent. You work for a consulting and staffing firm, helping select the right suppliers to support a specific team and project need.
- 
-Input:
-You will receive summary output with a 1-3 sentence summary of the project and a table with 1) criterion (could be a credential, experience, quality, or something else), 2) importance of that criterion on a scale of 1 [low] - 5 [high], and 2) explanation & rationale for why it's needed in the project.
- 
-Process to follow:
- 
-* You will look through every consultant profile provided to you.
-* You will screen each profile against the criteria you received in input. This is going to be you going through each profile and searching for the key words in the input query that match exactly to words or experiences and abilities that the profile contains. Not just assumptions of experience but out right text that verifies the comparison between the query and the files.
-* You will assess the fit of each person to these criteria, and give them a fit score between 1 and 100 based on how well they fit each criterion and the importance of that criterion.
- 
-## Your Task
-Review every supplier profile provided and score each against ALL criteria you received (technical + contextual + adjacent).
- 
-## Scoring Process
-For each supplier:
-1. Calculate score for EACH individual criterion (0-5 scale)
-2. Multiply by importance weight
-3. Sum weighted scores
-4. Normalize to 100-point scale
-Show breakdown:
-- Technical subtotal
-- Contextual subtotal
-- Overall total
- 
-## Output Format
-The table should have these columns:
-1) Name
-2) Total Score (out of 100)
-3) Technical subtotal (out of 100)
-4) Contextual subtotal (out of 100)
-5) Each Criteria Score
-6) Strengths Summary
-7) Weakness Summary
-8) Overall Summary on fit for position
- 
-Present candidates showing HOW they scored across dimensions, not just final number."""
- 
+
+CRITERIA_SYSTEM_PROMPT = """You are a business analyst at a consulting and staffing firm. Convert a project description into a focused screening rubric.
+
+Output exactly two things with NO extra text:
+
+1. A 1-2 sentence project summary.
+
+2. A pipe-delimited criteria table:
+| Category | Criterion | Importance | Evidence standard |
+
+Rules:
+- Category is "Technical" or "Contextual"
+- 4-7 criteria total — only the most critical ones
+- Use SHORT criterion names (2-4 words max, e.g. "GTM execution", "PMO cadence", "PE value creation")
+- Importance: 1-5 (5 = must-have)
+- Evidence standard: specific words/phrases to look for in a profile
+- No commentary, no headers, no explanation outside these two items"""
+
+SCREENING_SYSTEM_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
+
+You will receive a criteria table and supplier profiles.
+
+Output exactly four sections:
+
+SECTION 1 — HEADLINE
+One sentence: overall finding (e.g. "Two strong candidates identified; no exact sector match found")
+
+SECTION 2 — SCORING METHOD
+2-3 sentences explaining: how you weighted technical vs contextual (e.g. 40/60), which criteria drove the most differentiation, and the evidence standard you applied.
+
+SECTION 3 — RECOMMENDATION
+Bullet points (one per recommended candidate). Each bullet: name, action ("Advance as primary", "Advance as alternative"), and 1-2 sentences on why and any gap. End with one sentence on any universal gap across all candidates.
+
+SECTION 4 — RANKED TABLE
+| Rank / Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary | Overall Fit |
+
+Scoring rules:
+- Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
+- Multiply each score by importance weight, sum, normalize to 100
+- Technical and Contextual subtotals each normalized to 100 independently
+- "Each Criterion Score" column: write as inline list, e.g. "GTM 5; PMO 4; PE/consulting 3; Industrial 2"
+- Include only the top 10-15 candidates with meaningful scores (above ~30/100); skip candidates with no relevant evidence
+- Sort by Total Score descending
+- Each table cell: 1-3 sentences max, concise
+
+No commentary outside these four sections. Use plain pipe-delimited markdown table format."""
+
 # =========================
 # GOOGLE DRIVE
 # =========================
- 
+
 def get_supplier_docs():
     """Download all DOCX files from the Google Drive folder and extract text."""
     supplier_docs = []
- 
+
     query = (
         f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
         f"and mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' "
         f"and trashed=false"
     )
- 
+
     results = drive_service.files().list(
         q=query,
         fields="files(id, name)",
@@ -158,10 +129,10 @@ def get_supplier_docs():
         includeItemsFromAllDrives=True,
         corpora="allDrives"
     ).execute()
- 
+
     files = results.get("files", [])
     logging.info(f"Found {len(files)} supplier docs in Drive")
- 
+
     for file in files:
         try:
             req = drive_service.files().get_media(
@@ -173,163 +144,281 @@ def get_supplier_docs():
             done = False
             while not done:
                 _, done = downloader.next_chunk()
- 
+
             buffer.seek(0)
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
                 tmp.write(buffer.read())
                 tmp_path = tmp.name
- 
+
             doc = Document(tmp_path)
             text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
- 
+
             supplier_docs.append({
                 "name": file["name"].replace(".docx", "").replace("_", " "),
                 "text": text
             })
- 
+
             os.unlink(tmp_path)
- 
+
         except Exception as e:
             logging.warning(f"Failed to read {file['name']}: {e}")
- 
+
     return supplier_docs
- 
- 
+
+
+# =========================
+# TEXT HELPERS
+# =========================
+
+def strip_mention(text):
+    """Remove Slack @mention tags like <@U0C407F3AKT> from the message."""
+    return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+
+
+def _safe(text):
+    """Sanitize text for fpdf latin-1 core fonts."""
+    replacements = {
+        "•": "-", "’": "'", "‘": "'",
+        "“": '"', "”": '"', "–": "-",
+        "—": "--", "…": "...", "→": "->",
+        "✓": "v", "✔": "v", "✘": "x",
+        "é": "e", "ó": "o", "á": "a",
+    }
+    for ch, rep in replacements.items():
+        text = text.replace(ch, rep)
+    # Strip remaining bold/italic markers
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _strip_bold(text):
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", re.sub(r"\*(.+?)\*", r"\1", text))
+
+
 # =========================
 # AI CALLS
 # =========================
- 
+
 def create_supplier_criteria(message_text):
-    """Step 1: Generate rubric from client brief."""
     logging.info("Creating supplier criteria...")
- 
     response = openrouter.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
             {"role": "user", "content": (
-                "Please follow your system instructions to create supplier criteria "
-                "based on the project description or interview transcript you just received.\n\n"
+                "Create the screening criteria for this project brief:\n\n"
                 f"{message_text}"
             )}
         ]
     )
- 
     return response.choices[0].message.content
- 
- 
+
+
 def rank_suppliers(criteria, supplier_docs):
-    """Step 2: Score each supplier against the criteria."""
     logging.info(f"Ranking {len(supplier_docs)} suppliers...")
- 
     supplier_text = "\n\n---\n\n".join(
         f"SUPPLIER: {doc['name']}\n\n{doc['text']}"
         for doc in supplier_docs
     )
- 
-    user_message = (
-        f"Please look through the supplier profiles below and find the best suppliers "
-        f"to meet this project need based on the criteria you just received.\n\n"
-        f"CRITERIA:\n{criteria}\n\n"
-        f"SUPPLIER PROFILES:\n{supplier_text}"
-    )
- 
     response = openrouter.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": SCREENING_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": (
+                f"CRITERIA:\n{criteria}\n\n"
+                f"SUPPLIER PROFILES:\n{supplier_text}"
+            )}
         ]
     )
- 
     return response.choices[0].message.content
- 
- 
+
+
 # =========================
 # PDF GENERATION
 # =========================
- 
-def _safe_text(text):
-    """Replace common unicode chars so fpdf core fonts don't choke."""
-    replacements = {
-        "•": "-", "’": "'", "‘": "'",
-        "“": '"', "”": '"', "–": "-",
-        "—": "--", "…": "...",
-    }
-    for ch, rep in replacements.items():
-        text = text.replace(ch, rep)
-    return text.encode("latin-1", errors="replace").decode("latin-1")
- 
- 
+
+def _parse_table(lines):
+    """Parse markdown table lines into a list of row lists."""
+    rows = []
+    for line in lines:
+        if re.match(r"^\s*\|[-|:\s]+\|\s*$", line):
+            continue  # separator row
+        cells = [_safe(_strip_bold(c.strip())) for c in line.strip().strip("|").split("|")]
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _render_table(pdf, rows):
+    """Render a table with shaded header row."""
+    if not rows:
+        return
+    num_cols = len(rows[0])
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    col_w = page_w / num_cols
+    font_size = 8 if num_cols > 5 else 9
+
+    for r_idx, row in enumerate(rows):
+        # Pad/trim row to expected columns
+        while len(row) < num_cols:
+            row.append("")
+        row = row[:num_cols]
+
+        # Measure tallest cell in this row
+        pdf.set_font("Helvetica", "B" if r_idx == 0 else "", font_size)
+        cell_heights = []
+        for cell in row:
+            lines_needed = max(1, len(cell) // max(1, int(col_w / (font_size * 0.5))) + 1)
+            cell_heights.append(lines_needed * (font_size * 0.5 + 1))
+        row_h = max(cell_heights)
+        row_h = max(row_h, font_size + 2)
+
+        # Page break check
+        if pdf.get_y() + row_h > pdf.h - pdf.b_margin - 10:
+            pdf.add_page()
+
+        y0 = pdf.get_y()
+        if r_idx == 0:
+            pdf.set_fill_color(210, 210, 210)
+        elif r_idx % 2 == 0:
+            pdf.set_fill_color(245, 245, 245)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+
+        for c_idx, cell in enumerate(row):
+            pdf.set_xy(pdf.l_margin + c_idx * col_w, y0)
+            pdf.set_font("Helvetica", "B" if r_idx == 0 else "", font_size)
+            pdf.multi_cell(col_w, font_size + 2, cell, border=1,
+                           fill=True, max_line_height=font_size + 1)
+
+        pdf.set_y(y0 + row_h)
+
+    pdf.ln(4)
+
+
+def render_markdown(pdf, text):
+    """Render markdown text into the PDF with proper formatting."""
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Collect table block
+        if "|" in stripped and i + 1 < len(lines) and re.match(r"^\s*\|[-|:\s]+\|\s*$", lines[i + 1]):
+            table_lines = []
+            while i < len(lines) and "|" in lines[i]:
+                table_lines.append(lines[i])
+                i += 1
+            _render_table(pdf, _parse_table(table_lines))
+            continue
+
+        # Headings
+        if stripped.startswith("### "):
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.multi_cell(0, 6, _safe(stripped[4:]))
+            pdf.ln(1)
+        elif stripped.startswith("## "):
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.multi_cell(0, 7, _safe(stripped[3:]))
+            pdf.ln(1)
+        elif stripped.startswith("# "):
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.multi_cell(0, 8, _safe(stripped[2:]))
+            pdf.ln(1)
+        # Horizontal rule
+        elif re.match(r"^---+$", stripped):
+            pdf.set_draw_color(180, 180, 180)
+            pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+            pdf.set_draw_color(0, 0, 0)
+            pdf.ln(3)
+        # Bullet
+        elif re.match(r"^[\*\-]\s", stripped):
+            content = _safe(_strip_bold(re.sub(r"^[\*\-]\s+", "", stripped)))
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_x(pdf.l_margin + 5)
+            pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - 5, 5, "- " + content)
+        # Numbered list
+        elif re.match(r"^\d+\.\s", stripped):
+            content = _safe(_strip_bold(re.sub(r"^\d+\.\s+", "", stripped)))
+            num = re.match(r"^(\d+)\.", stripped).group(1)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_x(pdf.l_margin + 5)
+            pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - 5, 5, f"{num}. {content}")
+        # Empty line
+        elif stripped == "":
+            pdf.ln(3)
+        # Regular text
+        else:
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5, _safe(_strip_bold(stripped)))
+
+        i += 1
+
+
 def generate_recommendations_pdf(criteria, rankings, original_message):
-    """Generate the Supplier Recommendations PDF."""
     pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
- 
+
     # Title
-    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_font("Helvetica", "B", 18)
     pdf.cell(0, 10, "Supplier Recommendations", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(120, 120, 120)
     pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}",
              new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
     pdf.ln(4)
- 
+
     # Project Brief
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, "Project Brief", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, _safe_text(original_message))
-    pdf.ln(4)
- 
+    pdf.multi_cell(0, 5, _safe(original_message))
+    pdf.ln(6)
+
     # Criteria
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "Supplier Criteria", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, _safe_text(criteria))
+    pdf.cell(0, 8, "Screening Criteria", new_x="LMARGIN", new_y="NEXT")
+    render_markdown(pdf, criteria)
     pdf.ln(4)
- 
+
     # Rankings
     pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "Ranked Supplier Results", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, _safe_text(rankings))
- 
+    pdf.cell(0, 8, "Supplier Screening Results", new_x="LMARGIN", new_y="NEXT")
+    render_markdown(pdf, rankings)
+
     filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.pdf")
     pdf.output(filename)
     return filename
- 
- 
+
+
 # =========================
 # PIPELINE
 # =========================
- 
+
 def process_message(message_text, channel_id, thread_ts, client):
-    """Full pipeline — runs in background thread."""
     try:
-        # Step 1: Create criteria
         criteria = create_supplier_criteria(message_text)
         logging.info("Criteria created")
- 
-        # Step 2: Get supplier docs from Drive
+
         supplier_docs = get_supplier_docs()
- 
+
         if not supplier_docs:
             client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
+                channel=channel_id, thread_ts=thread_ts,
                 text="No supplier profiles found in the Google Drive folder."
             )
             return
- 
-        # Step 3: Rank suppliers
+
         rankings = rank_suppliers(criteria, supplier_docs)
         logging.info("Rankings complete")
- 
-        # Step 4: Generate PDF
+
         pdf_path = generate_recommendations_pdf(criteria, rankings, message_text)
- 
-        # Step 5: Upload to Slack thread
+
         client.files_upload_v2(
             channel=channel_id,
             thread_ts=thread_ts,
@@ -337,74 +426,70 @@ def process_message(message_text, channel_id, thread_ts, client):
             filename="Supplier_Recommendations.pdf",
             initial_comment="Here are your supplier recommendations! 📋"
         )
- 
+
         logging.info("Supplier recommendations sent to Slack")
- 
+
     except Exception as e:
-        logging.error(f"Pipeline failed: {e}")
+        logging.error(f"Pipeline failed: {e}", exc_info=True)
         client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=f"Something went wrong processing your request: {str(e)}"
+            channel=channel_id, thread_ts=thread_ts,
+            text=f"Something went wrong: {str(e)}"
         )
- 
- 
+
+
 # =========================
 # SLACK EVENT HANDLER
 # =========================
- 
+
 @slack_app.event("message")
 def handle_message(event, client):
-    # Skip bot messages and subtypes (joins, leaves, etc.)
     if event.get("bot_id") or event.get("subtype"):
         return
- 
+
     channel_id = event.get("channel")
     if channel_id != SLACK_CHANNEL_ID:
         return
- 
-    message_text = event.get("text", "").strip()
-    thread_ts = event.get("ts")
- 
+
+    raw_text = event.get("text", "").strip()
+    message_text = strip_mention(raw_text)
+
     if not message_text:
         return
- 
+
+    thread_ts = event.get("ts")
     logging.info(f"Received message: {message_text[:100]}...")
- 
-    # Acknowledge immediately so user knows it's working
+
     client.chat_postMessage(
         channel=channel_id,
         thread_ts=thread_ts,
         text="Got it! Analyzing your request and scanning the supplier database... this may take a minute. 🔍"
     )
- 
-    # Process in background thread so Slack doesn't time out
+
     thread = threading.Thread(
         target=process_message,
         args=(message_text, channel_id, thread_ts, client)
     )
     thread.daemon = True
     thread.start()
- 
- 
+
+
 # =========================
 # FLASK SERVER
 # =========================
- 
+
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(slack_app)
- 
- 
+
+
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
     return handler.handle(request)
- 
- 
+
+
 @flask_app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
- 
- 
+
+
 if __name__ == "__main__":
     flask_app.run(port=int(os.getenv("PORT", 3000)))
- 
