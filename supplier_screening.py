@@ -171,27 +171,27 @@ def get_supplier_docs():
 # =========================
 
 def strip_mention(text):
-    “””Remove Slack @mention tags like <@U0C407F3AKT> from the message.”””
-    return re.sub(r”<@[A-Z0-9]+>\s*”, “”, text).strip()
+    """Remove Slack @mention tags like <@U0C407F3AKT> from the message."""
+    return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
 def _strip_md(text):
-    “””Strip markdown bold/italic markers.”””
-    text = re.sub(r”\*\*(.+?)\*\*”, r”\1”, text)
-    text = re.sub(r”\*(.+?)\*”, r”\1”, text)
+    """Strip markdown bold/italic markers."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
     return text.strip()
 
 
 def _parse_md_table(text):
-    “””Extract rows from a markdown pipe-delimited table.”””
+    """Extract rows from a markdown pipe-delimited table."""
     rows = []
-    for line in text.split(“\n”):
+    for line in text.split("\n"):
         line = line.strip()
-        if not line.startswith(“|”):
+        if not line.startswith("|"):
             continue
-        if re.match(r”^\|[-|:\s]+\|$”, line):
+        if re.match(r"^\|[-|:\s]+\|$", line):
             continue  # separator row
-        cells = [_strip_md(c.strip()) for c in line.strip(“|”).split(“|”)]
+        cells = [_strip_md(c.strip()) for c in line.strip("|").split("|")]
         if any(cells):
             rows.append(cells)
     return rows
