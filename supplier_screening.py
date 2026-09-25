@@ -16,8 +16,7 @@ from openai import OpenAI
 from docx import Document
 from docx.shared import Pt, RGBColor
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from google.auth.transport.requests import AuthorizedSession
 
 # =========================
 # CONFIG + LOGGING
@@ -51,7 +50,7 @@ service_account_info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info, scopes=SCOPES
 )
-drive_service = build("drive", "v3", credentials=credentials)
+drive_session = AuthorizedSession(credentials)
 
 SLACK_CHANNEL_ID = "C0C2QRTGAUV"
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
@@ -115,41 +114,40 @@ No other text outside these three sections."""
 # =========================
 
 def get_supplier_docs():
-    """Download all DOCX files from the Google Drive folder and extract text."""
+    """Download all DOCX files from the Google Drive folder and extract text.
+    Uses AuthorizedSession (requests-based) to avoid httplib2 SSL issues on Python 3.13.
+    """
     supplier_docs = []
 
-    query = (
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
-        f"and mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' "
-        f"and trashed=false"
+    # List files
+    list_resp = drive_session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={
+            "q": (
+                f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
+                f"and mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' "
+                f"and trashed=false"
+            ),
+            "fields": "files(id, name)",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "corpora": "allDrives",
+        }
     )
-
-    results = drive_service.files().list(
-        q=query,
-        fields="files(id, name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        corpora="allDrives"
-    ).execute()
-
-    files = results.get("files", [])
+    list_resp.raise_for_status()
+    files = list_resp.json().get("files", [])
     logging.info(f"Found {len(files)} supplier docs in Drive")
 
     for file in files:
         try:
-            req = drive_service.files().get_media(
-                fileId=file["id"],
-                supportsAllDrives=True
+            dl_resp = drive_session.get(
+                f"https://www.googleapis.com/drive/v3/files/{file['id']}",
+                params={"alt": "media", "supportsAllDrives": "true"}
             )
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, req)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
+            dl_resp.raise_for_status()
 
-            buffer.seek(0)
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-                tmp.write(buffer.read())
+                tmp.write(dl_resp.content)
                 tmp_path = tmp.name
 
             doc = Document(tmp_path)
