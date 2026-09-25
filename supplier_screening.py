@@ -205,6 +205,7 @@ def create_supplier_criteria(message_text):
     logging.info("Creating supplier criteria...")
     response = openrouter.chat.completions.create(
         model=MODEL,
+        max_tokens=1000,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
             {"role": "user", "content": (
@@ -226,6 +227,7 @@ def _score_batch(criteria, batch_docs):
     )
     response = openrouter.chat.completions.create(
         model=MODEL,
+        max_tokens=8000,
         messages=[
             {"role": "system", "content": BATCH_SCORING_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
@@ -287,6 +289,7 @@ def rank_suppliers(criteria, supplier_docs):
 
     synthesis_response = openrouter.chat.completions.create(
         model=MODEL,
+        max_tokens=2000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nTOP CANDIDATES (pre-scored):\n{top_summary}"}
