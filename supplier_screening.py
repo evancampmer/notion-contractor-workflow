@@ -41,7 +41,7 @@ slack_app = App(
 
 openrouter = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY_ALINA")
+    api_key=os.getenv("OPENROUTER_API_KEY")
 )
 
 MODEL = "anthropic/claude-sonnet-4-5"
@@ -79,34 +79,36 @@ Rules:
 - Evidence standard: specific words/phrases to look for in a profile
 - No commentary, no headers, no explanation outside these two items"""
 
-SCREENING_SYSTEM_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
+BATCH_SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
 
-You will receive a criteria table and supplier profiles.
+Score EVERY supplier profile in this batch against the criteria. Return ONLY a pipe-delimited table — no other text, no preamble, no commentary.
 
-Output exactly four sections:
-
-SECTION 1 — HEADLINE
-One sentence: overall finding (e.g. "Two strong candidates identified; no exact sector match found")
-
-SECTION 2 — SCORING METHOD
-2-3 sentences explaining: how you weighted technical vs contextual (e.g. 40/60), which criteria drove the most differentiation, and the evidence standard you applied.
-
-SECTION 3 — RECOMMENDATION
-Bullet points (one per recommended candidate). Each bullet: name, action ("Advance as primary", "Advance as alternative"), and 1-2 sentences on why and any gap. End with one sentence on any universal gap across all candidates.
-
-SECTION 4 — RANKED TABLE
-| Rank / Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary | Overall Fit |
+Table columns (use exactly these headers):
+| Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary |
 
 Scoring rules:
 - Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
-- Multiply each score by importance weight, sum, normalize to 100
-- Technical and Contextual subtotals each normalized to 100 independently
-- "Each Criterion Score" column: write as inline list, e.g. "GTM 5; PMO 4; PE/consulting 3; Industrial 2"
-- Include only the top 10-15 candidates with meaningful scores (above ~30/100); skip candidates with no relevant evidence
+- Multiply each score by its importance weight, sum all weighted scores, normalize to 100
+- Technical subtotal and Contextual subtotal each normalized to 100 independently
+- "Each Criterion Score": inline list using the short criterion names from the criteria table, e.g. "510k sub 5; FDA reg 4; Tech writing 2"
+- Score ALL suppliers in this batch; give 0 if no relevant evidence exists
 - Sort by Total Score descending
-- Each table cell: 1-3 sentences max, concise
+- Each cell: 1-2 sentences max"""
 
-No commentary outside these four sections. Use plain pipe-delimited markdown table format."""
+SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing final candidate scores.
+
+You will receive the top-scored candidates after all batches have been scored. Write exactly three sections:
+
+SECTION 1 — HEADLINE
+One sentence: overall finding (e.g. "Three strong candidates identified; no exact FDA regulatory specialist found in database")
+
+SECTION 2 — SCORING METHOD
+2-3 sentences: how technical vs contextual were weighted, which criteria drove the most differentiation, and the evidence standard applied.
+
+SECTION 3 — RECOMMENDATION
+One bullet per recommended candidate (top 5 maximum). Each bullet: name, action ("Advance as primary" or "Advance as alternative"), 1-2 sentences on fit and key gap. End with one sentence on any universal gap across all candidates.
+
+No other text outside these three sections."""
 
 # =========================
 # GOOGLE DRIVE
@@ -171,27 +173,27 @@ def get_supplier_docs():
 # =========================
 
 def strip_mention(text):
-    """Remove Slack @mention tags like <@U0C407F3AKT> from the message."""
-    return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+    “””Remove Slack @mention tags like <@U0C407F3AKT> from the message.”””
+    return re.sub(r”<@[A-Z0-9]+>\s*”, “”, text).strip()
 
 
 def _strip_md(text):
-    """Strip markdown bold/italic markers."""
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    “””Strip markdown bold/italic markers.”””
+    text = re.sub(r”\*\*(.+?)\*\*”, r”\1”, text)
+    text = re.sub(r”\*(.+?)\*”, r”\1”, text)
     return text.strip()
 
 
 def _parse_md_table(text):
-    """Extract rows from a markdown pipe-delimited table."""
+    “””Extract rows from a markdown pipe-delimited table.”””
     rows = []
-    for line in text.split("\n"):
+    for line in text.split(“\n”):
         line = line.strip()
-        if not line.startswith("|"):
+        if not line.startswith(“|”):
             continue
-        if re.match(r"^\|[-|:\s]+\|$", line):
+        if re.match(r”^\|[-|:\s]+\|$”, line):
             continue  # separator row
-        cells = [_strip_md(c.strip()) for c in line.strip("|").split("|")]
+        cells = [_strip_md(c.strip()) for c in line.strip(“|”).split(“|”)]
         if any(cells):
             rows.append(cells)
     return rows
@@ -216,23 +218,90 @@ def create_supplier_criteria(message_text):
     return response.choices[0].message.content
 
 
-def rank_suppliers(criteria, supplier_docs):
-    logging.info(f"Ranking {len(supplier_docs)} suppliers...")
+BATCH_SIZE = 30
+
+def _score_batch(criteria, batch_docs):
+    """Score one batch of supplier docs and return the parsed table rows."""
     supplier_text = "\n\n---\n\n".join(
         f"SUPPLIER: {doc['name']}\n\n{doc['text']}"
-        for doc in supplier_docs
+        for doc in batch_docs
     )
     response = openrouter.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": SCREENING_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"CRITERIA:\n{criteria}\n\n"
-                f"SUPPLIER PROFILES:\n{supplier_text}"
-            )}
+            {"role": "system", "content": BATCH_SCORING_PROMPT},
+            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
         ]
     )
     return response.choices[0].message.content
+
+
+def _extract_score(row):
+    """Parse the Total Score from a table row (column index 1)."""
+    try:
+        return int(re.search(r"\d+", row[1]).group())
+    except Exception:
+        return 0
+
+
+def _is_header_row(row):
+    """Detect if a row is a header (not a data row)."""
+    return any(h in row[0].lower() for h in ["name", "rank", "supplier"])
+
+
+def rank_suppliers(criteria, supplier_docs):
+    """Score all suppliers in batches, merge results, return top candidates + synthesis."""
+    batches = [supplier_docs[i:i+BATCH_SIZE] for i in range(0, len(supplier_docs), BATCH_SIZE)]
+    logging.info(f"Scoring {len(supplier_docs)} suppliers across {len(batches)} batches of up to {BATCH_SIZE}")
+
+    header_row = None
+    all_data_rows = []
+
+    for idx, batch in enumerate(batches):
+        logging.info(f"Batch {idx+1}/{len(batches)}: scoring {len(batch)} suppliers...")
+        batch_text = _score_batch(criteria, batch)
+        rows = _parse_md_table(batch_text)
+
+        if not rows:
+            logging.warning(f"Batch {idx+1} returned no parseable rows")
+            continue
+
+        for row in rows:
+            if _is_header_row(row):
+                if header_row is None:
+                    header_row = row
+            else:
+                all_data_rows.append(row)
+
+    # Sort all candidates by Total Score, take top 15
+    all_data_rows.sort(key=_extract_score, reverse=True)
+    top_rows = all_data_rows[:15]
+    logging.info(f"Merged {len(all_data_rows)} scored candidates, kept top {len(top_rows)}")
+
+    # Build synthesis (headline + scoring method + recommendation) from top results
+    top_summary = "\n".join(
+        f"{row[0]}: Total {row[1]}, Tech {row[2] if len(row) > 2 else 'N/A'}, "
+        f"Contextual {row[3] if len(row) > 3 else 'N/A'}, "
+        f"Criteria scores: {row[4] if len(row) > 4 else 'N/A'}, "
+        f"Strengths: {row[5] if len(row) > 5 else 'N/A'}"
+        for row in top_rows
+    )
+
+    synthesis_response = openrouter.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYNTHESIS_PROMPT},
+            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nTOP CANDIDATES (pre-scored):\n{top_summary}"}
+        ]
+    )
+    synthesis = synthesis_response.choices[0].message.content
+    logging.info("Synthesis complete")
+
+    return {
+        "synthesis": synthesis,
+        "header_row": header_row,
+        "ranked_rows": top_rows
+    }
 
 
 # =========================
@@ -262,25 +331,37 @@ def _add_table_to_doc(doc, rows):
 
 
 def _parse_rankings(rankings_text):
-    """Split the AI screening output into its four sections."""
+    """Split the AI screening output into its four sections.
+    Handles varied formatting: plain, bold (**SECTION 1**), markdown headers (## SECTION 1), etc.
+    """
     sections = {1: [], 2: [], 3: [], 4: []}
     current = None
     for line in rankings_text.split("\n"):
-        s = line.strip()
-        if re.match(r"SECTION\s*1", s, re.IGNORECASE):
+        # Strip markdown bold/header markers before checking for section labels
+        clean = re.sub(r"[#\*\_]+", "", line).strip()
+        if re.search(r"SECTION\s*1", clean, re.IGNORECASE):
             current = 1; continue
-        if re.match(r"SECTION\s*2", s, re.IGNORECASE):
+        if re.search(r"SECTION\s*2", clean, re.IGNORECASE):
             current = 2; continue
-        if re.match(r"SECTION\s*3", s, re.IGNORECASE):
+        if re.search(r"SECTION\s*3", clean, re.IGNORECASE):
             current = 3; continue
-        if re.match(r"SECTION\s*4", s, re.IGNORECASE):
+        if re.search(r"SECTION\s*4", clean, re.IGNORECASE):
             current = 4; continue
-        if current:
+        if current is not None:
             sections[current].append(line)
     return {k: "\n".join(v).strip() for k, v in sections.items()}
 
 
 def generate_recommendations_docx(criteria, rankings, original_message):
+    """Build the output DOCX matching Cassidy's style.
+
+    `rankings` is a dict returned by rank_suppliers():
+        {
+            "synthesis": <str — the 3-section AI synthesis>,
+            "header_row": <list — column headers from batch scoring>,
+            "ranked_rows": <list of lists — top-15 candidate rows>,
+        }
+    """
     doc = Document()
 
     # Derive a short title from the first non-empty line of the message
@@ -294,7 +375,7 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     # ── Scoring method ──────────────────────────────────────────
     doc.add_heading("Scoring method", level=3)
 
-    # Criteria summary (text before the table)
+    # Criteria summary (prose before the pipe table)
     criteria_lines = criteria.split("\n")
     summary_parts, table_lines = [], []
     in_table = False
@@ -312,10 +393,18 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     if criteria_rows:
         _add_table_to_doc(doc, criteria_rows)
 
-    # Scoring method paragraph from rankings section 2
-    sections = _parse_rankings(rankings)
+    # Parse synthesis into sections 1-3
+    synthesis_text = rankings.get("synthesis", "")
+    sections = _parse_rankings(synthesis_text)
+    logging.info(f"Parsed synthesis sections — lengths: { {k: len(v) for k, v in sections.items()} }")
+
+    # Section 1 — headline (brief overall finding paragraph)
+    if sections[1]:
+        doc.add_paragraph(_strip_md(sections[1]))
+
+    # Section 2 — scoring method prose
     if sections[2]:
-        doc.add_paragraph(sections[2])
+        doc.add_paragraph(_strip_md(sections[2]))
 
     # ── Recommendation ──────────────────────────────────────────
     doc.add_heading("Recommendation", level=3)
@@ -329,9 +418,12 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         else:
             doc.add_paragraph(_strip_md(s))
 
-    # ── Ranked table ────────────────────────────────────────────
-    ranked_rows = _parse_md_table(sections[4])
-    if ranked_rows:
+    # ── Ranked candidate table (from merged batch results) ───────
+    header_row = rankings.get("header_row")
+    ranked_rows = rankings.get("ranked_rows", [])
+    if header_row and ranked_rows:
+        _add_table_to_doc(doc, [header_row] + ranked_rows)
+    elif ranked_rows:
         _add_table_to_doc(doc, ranked_rows)
 
     filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.docx")
