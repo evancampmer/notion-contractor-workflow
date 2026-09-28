@@ -59,7 +59,7 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 OUTPUT_FOLDER = "output_docs"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-TOP_K = 20          # profiles to retrieve via vector search before scoring
+TOP_K = 30          # profiles to retrieve per pass via vector search before scoring
 PROFILE_CHARS = 3000  # max chars per profile sent to the scoring LLM
 
 # =========================
@@ -85,34 +85,34 @@ Rules:
 
 SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
 
-Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited table — no other text, no preamble, no commentary.
+Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited table — no preamble, no commentary, no extra text.
 
 Table columns (use exactly these headers):
-| Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary |
+| Rank / Name | Total Score | Technical / Contextual Subtotals | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary | Overall Summary on Fit |
 
 Scoring rules:
+- Rank / Name: rank number + full name, e.g. "1. Jane Smith"
+- Total Score: integer 0-100 (weighted sum of all criteria scores normalized to 100)
+- Technical / Contextual Subtotals: each independently normalized to 100, format "X / Y" (Technical / Contextual)
+- Each Criterion Score: "short_name: N; short_name: N; ..." using the exact short criterion names from the criteria table, score 0-5 each
 - Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
-- Multiply each score by its importance weight, sum all weighted scores, normalize to 100
-- Technical subtotal and Contextual subtotal each normalized to 100 independently
-- "Each Criterion Score": inline list using the short criterion names from the criteria table, e.g. "510k sub 5; FDA reg 4; Tech writing 2"
-- Score ALL suppliers; give 0 if no relevant evidence exists
-- Sort by Total Score descending
-- Each cell: 1-2 sentences max"""
+- Strengths Summary: 1-2 sentences citing specific evidence; enclose 1-2 key phrases in **double asterisks**
+- Weakness Summary: 1-2 sentences on specific gaps, no formatting
+- Overall Summary on Fit: 1-2 sentences; first sentence must be a clear verdict (e.g. "Best available adjacent candidate, but not a verified X lead.")
+- Score ALL suppliers; assign 0 on any criterion with no relevant evidence
+- Sort rows by Total Score descending"""
 
-SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing final candidate scores.
+SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing a completed supplier screen.
 
-You will receive the top-scored candidates. Write exactly three sections:
+Write exactly three labeled sections. Use **double asterisks** around key terms inline where indicated. No other text outside these sections.
 
-SECTION 1 — HEADLINE
-One sentence: overall finding (e.g. "Three strong candidates identified; no exact FDA regulatory specialist found in database")
+HEADLINE: [One short noun phrase — the overall finding. Format: "Screening result: [specific finding]". Example: "Screening result: no verified 510(k) filing specialist identified"]
 
-SECTION 2 — SCORING METHOD
-2-3 sentences: how technical vs contextual were weighted, which criteria drove the most differentiation, and the evidence standard applied.
+OPENING: [One paragraph. Describe what was screened and the key conclusion. Bold 2-4 key criteria names and the core conclusion phrase using **double asterisks**. Style: "I screened the supplier profiles for explicit evidence of **X**, **Y**, and **Z**. [Finding sentence with **bold conclusion**]."]
 
-SECTION 3 — RECOMMENDATION
-One bullet per recommended candidate (top 5 maximum). Each bullet: name, action ("Advance as primary" or "Advance as alternative"), 1-2 sentences on fit and key gap. End with one sentence on any universal gap across all candidates.
-
-No other text outside these three sections."""
+RECOMMENDATION: [2 paragraphs separated by a blank line.
+Para 1: Overall action recommendation. Bold key candidate names and key roles or caveats with **double asterisks**.
+Para 2: What the ideal required profile should explicitly demonstrate. Bold 2-3 key requirements with **double asterisks**.]"""
 
 # =========================
 # GOOGLE DRIVE
@@ -286,6 +286,42 @@ def retrieve_top_k(query_text, k=TOP_K):
     return top_docs
 
 
+def retrieve_two_pass(message_text, criteria_text, k=TOP_K):
+    """Two-pass retrieval: narrow (message+criteria) + broad (criterion names only).
+    Catches both exact-match profiles and adjacent-skill profiles like Milan Babic.
+    Returns deduplicated merged list, pass1 results first."""
+
+    # Pass 1 — narrow: full message + criteria (exact terminology match)
+    query1 = f"{message_text}\n\n{criteria_text}"
+    pass1 = retrieve_top_k(query1, k=k)
+
+    # Pass 2 — broad: just the criterion names, no evidence standards
+    # Extracts e.g. "510(k) submission experience; FDA regulatory strategy; ..."
+    criterion_names = []
+    for line in criteria_text.split("\n"):
+        if "|" not in line:
+            continue
+        if re.match(r"^\|[-|:\s]+\|$", line.strip()):
+            continue
+        parts = [p.strip() for p in line.strip("|").split("|")]
+        if len(parts) >= 2 and parts[1].lower() not in ("criterion", ""):
+            criterion_names.append(parts[1])
+    broad_query = ("adjacent experience and background in: " + "; ".join(criterion_names)
+                   if criterion_names else message_text)
+    pass2 = retrieve_top_k(broad_query, k=k)
+
+    # Merge, deduplicate by name (pass1 order preserved first)
+    seen = set()
+    merged = []
+    for doc in pass1 + pass2:
+        if doc["name"] not in seen:
+            seen.add(doc["name"])
+            merged.append(doc)
+
+    logging.info(f"Two-pass retrieval: pass1={len(pass1)}, pass2={len(pass2)}, merged={len(merged)} unique profiles")
+    return merged
+
+
 # Start building the index in the background immediately on startup
 threading.Thread(target=_build_index, daemon=True).start()
 
@@ -368,12 +404,11 @@ def score_suppliers(criteria, supplier_docs):
 
 
 def synthesize(criteria, top_rows):
-    """Run synthesis pass over top-scored candidates."""
-    top_summary = "\n".join(
-        f"{row[0]}: Total {row[1]}, "
-        f"Tech {row[2] if len(row) > 2 else 'N/A'}, "
-        f"Contextual {row[3] if len(row) > 3 else 'N/A'}, "
-        f"Strengths: {row[5] if len(row) > 5 else 'N/A'}"
+    """Generate HEADLINE/OPENING/RECOMMENDATION from scored candidates."""
+    candidate_summary = "\n".join(
+        f"{row[0]}: Total={row[1]}, Subtotals={row[2] if len(row) > 2 else 'N/A'}, "
+        f"Strengths: {row[4] if len(row) > 4 else 'N/A'}, "
+        f"Gaps: {row[5] if len(row) > 5 else 'N/A'}"
         for row in top_rows
     )
     response = openrouter.chat.completions.create(
@@ -381,7 +416,7 @@ def synthesize(criteria, top_rows):
         max_tokens=2000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
-            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nTOP CANDIDATES:\n{top_summary}"}
+            {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSCORED CANDIDATES (ranked):\n{candidate_summary}"}
         ]
     )
     return response.choices[0].message.content
@@ -402,14 +437,14 @@ def rank_suppliers(criteria, supplier_docs):
             data_rows.append(row)
 
     data_rows.sort(key=_extract_score, reverse=True)
+    top_rows = data_rows[:15]
+    logging.info(f"Scored {len(data_rows)} candidates, kept top {len(top_rows)}")
 
-    # Keep candidates scoring >= 70, but always include at least top 3
-    MIN_SCORE = 70
-    qualified = [r for r in data_rows if _extract_score(r) >= MIN_SCORE]
-    if len(qualified) < 3:
-        qualified = data_rows[:3]  # fallback: top 3 regardless of score
-    top_rows = qualified[:15]
-    logging.info(f"Scored {len(data_rows)} candidates: {len(qualified)} scored >= {MIN_SCORE}, kept {len(top_rows)}")
+    # Build reference filenames from ranked candidate names
+    references = []
+    for row in top_rows:
+        name_raw = re.sub(r"^\d+\.\s*", "", row[0]).strip()
+        references.append(name_raw.replace(" ", "_") + ".docx")
 
     synthesis = synthesize(criteria, top_rows)
     logging.info("Synthesis complete")
@@ -417,7 +452,8 @@ def rank_suppliers(criteria, supplier_docs):
     return {
         "synthesis": synthesis,
         "header_row": header_row,
-        "ranked_rows": top_rows
+        "ranked_rows": top_rows,
+        "references": references
     }
 
 
@@ -425,96 +461,209 @@ def rank_suppliers(criteria, supplier_docs):
 # DOCX GENERATION
 # =========================
 
-def _add_table_to_doc(doc, rows):
+def _add_rich_paragraph(doc, text, style="Normal"):
+    """Add a paragraph with **bold** markers parsed into bold runs."""
+    para = doc.add_paragraph(style=style)
+    parts = re.split(r"(\*\*[^*]+\*\*)", text)
+    for part in parts:
+        if part.startswith("**") and part.endswith("**"):
+            run = para.add_run(part[2:-2])
+            run.bold = True
+        elif part:
+            para.add_run(part)
+    return para
+
+
+def _set_cell_rich(cell, text):
+    """Set cell content with **bold** markers parsed into bold runs."""
+    cell.text = ""
+    para = cell.paragraphs[0]
+    parts = re.split(r"(\*\*[^*]+\*\*)", str(text))
+    for part in parts:
+        if part.startswith("**") and part.endswith("**"):
+            run = para.add_run(part[2:-2])
+            run.bold = True
+        elif part:
+            para.add_run(part)
+
+
+def _bold_criterion_numbers(cell, text):
+    """Set criterion scores cell with score numbers bolded."""
+    cell.text = ""
+    para = cell.paragraphs[0]
+    parts = re.split(r"(\b\d+\b)", str(text))
+    for part in parts:
+        run = para.add_run(part)
+        if re.match(r"^\d+$", part):
+            run.bold = True
+
+
+def _bold_first_sentence(cell, text):
+    """Set cell content with the first sentence bolded."""
+    cell.text = ""
+    para = cell.paragraphs[0]
+    m = re.match(r"^([^.!?]+[.!?])\s*(.*)", str(text), re.DOTALL)
+    if m:
+        run = para.add_run(m.group(1))
+        run.bold = True
+        if m.group(2):
+            para.add_run(" " + m.group(2))
+    else:
+        run = para.add_run(str(text))
+        run.bold = True
+
+
+def _add_criteria_table(doc, rows):
+    """Add the 4-column criteria table (all plain text)."""
     if not rows:
         return
-    num_cols = len(rows[0])
+    num_cols = 4
     table = doc.add_table(rows=len(rows), cols=num_cols)
     table.style = "Table Grid"
     for r_idx, row in enumerate(rows):
-        while len(row) < num_cols:
-            row.append("")
+        row = list(row) + [""] * (num_cols - len(row))
         row = row[:num_cols]
         for c_idx, cell_text in enumerate(row):
-            cell = table.cell(r_idx, c_idx)
-            cell.text = cell_text
-            para = cell.paragraphs[0]
-            if r_idx == 0:
-                for run in para.runs:
-                    run.bold = True
+            table.cell(r_idx, c_idx).text = cell_text
     doc.add_paragraph()
 
 
-def _parse_rankings(rankings_text):
-    sections = {1: [], 2: [], 3: [], 4: []}
+def _add_ranking_table(doc, header_row, data_rows):
+    """Add the 7-column ranking table with Cassidy-style per-column bold formatting."""
+    if not data_rows:
+        return
+    num_cols = 7
+    all_rows = ([header_row] if header_row else []) + data_rows
+    table = doc.add_table(rows=len(all_rows), cols=num_cols)
+    table.style = "Table Grid"
+
+    for r_idx, row in enumerate(all_rows):
+        row = list(row) + [""] * (num_cols - len(row))
+        row = row[:num_cols]
+        is_header = (r_idx == 0 and header_row is not None)
+
+        for c_idx, cell_text in enumerate(row):
+            cell = table.cell(r_idx, c_idx)
+            if is_header:
+                cell.text = cell_text  # header: plain text
+            else:
+                if c_idx in (0, 1, 2):
+                    # Rank/Name, Total Score, Subtotals: entire content bold
+                    cell.text = ""
+                    run = cell.paragraphs[0].add_run(cell_text)
+                    run.bold = True
+                elif c_idx == 3:
+                    # Criterion scores: bold just the numbers
+                    _bold_criterion_numbers(cell, cell_text)
+                elif c_idx == 4:
+                    # Strengths: **markers** from LLM
+                    _set_cell_rich(cell, cell_text)
+                elif c_idx == 5:
+                    # Weakness: plain
+                    cell.text = cell_text
+                elif c_idx == 6:
+                    # Overall Summary on Fit: first sentence bold
+                    _bold_first_sentence(cell, cell_text)
+
+    doc.add_paragraph()
+
+
+def _parse_synthesis(synthesis_text):
+    """Parse HEADLINE/OPENING/RECOMMENDATION sections from synthesis output."""
+    result = {"headline": "", "opening": "", "recommendation": ""}
     current = None
-    for line in rankings_text.split("\n"):
-        clean = re.sub(r"[#\*\_]+", "", line).strip()
-        if re.search(r"SECTION\s*1", clean, re.IGNORECASE):
-            current = 1; continue
-        if re.search(r"SECTION\s*2", clean, re.IGNORECASE):
-            current = 2; continue
-        if re.search(r"SECTION\s*3", clean, re.IGNORECASE):
-            current = 3; continue
-        if re.search(r"SECTION\s*4", clean, re.IGNORECASE):
-            current = 4; continue
-        if current is not None:
-            sections[current].append(line)
-    return {k: "\n".join(v).strip() for k, v in sections.items()}
+    lines = {"headline": [], "opening": [], "recommendation": []}
+
+    for line in synthesis_text.split("\n"):
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("HEADLINE:"):
+            current = "headline"
+            rest = stripped[len("HEADLINE:"):].strip()
+            if rest:
+                lines["headline"].append(rest)
+        elif upper.startswith("OPENING:"):
+            current = "opening"
+            rest = stripped[len("OPENING:"):].strip()
+            if rest:
+                lines["opening"].append(rest)
+        elif upper.startswith("RECOMMENDATION:"):
+            current = "recommendation"
+            rest = stripped[len("RECOMMENDATION:"):].strip()
+            if rest:
+                lines["recommendation"].append(rest)
+        elif current:
+            lines[current].append(line)
+
+    result["headline"] = "\n".join(lines["headline"]).strip()
+    result["opening"] = "\n".join(lines["opening"]).strip()
+    result["recommendation"] = "\n".join(lines["recommendation"]).strip()
+    return result
 
 
 def generate_recommendations_docx(criteria, rankings, original_message):
     doc = Document()
 
-    title_line = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
-    if len(title_line) > 80:
-        title_line = title_line[:77] + "..."
+    synthesis_text = rankings.get("synthesis", "")
+    sections = _parse_synthesis(synthesis_text)
+    logging.info(f"Synthesis sections: { {k: len(v) for k, v in sections.items()} }")
 
-    doc.add_heading(f"Supplier screening results — {title_line}", level=2)
-    doc.add_heading("Scoring method", level=3)
+    # H2: headline from synthesis, fallback to original message
+    headline = sections.get("headline", "").strip()
+    if not headline:
+        headline = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
+        if len(headline) > 80:
+            headline = headline[:77] + "..."
+    doc.add_heading(headline, level=2)
 
-    criteria_lines = criteria.split("\n")
-    summary_parts, table_lines = [], []
-    in_table = False
-    for line in criteria_lines:
-        if "|" in line:
-            in_table = True
-        (table_lines if in_table else summary_parts).append(line)
+    # Opening paragraph with inline bold
+    opening = sections.get("opening", "").strip()
+    if opening:
+        _add_rich_paragraph(doc, opening)
 
-    summary_text = " ".join(l.strip() for l in summary_parts if l.strip())
-    if summary_text:
-        doc.add_paragraph(summary_text)
+    # H3: Scoring criteria and weights
+    doc.add_heading("Scoring criteria and weights", level=3)
+    doc.add_paragraph()
 
+    # Calculation line: "Calculation:" bold + rest plain
+    calc_para = doc.add_paragraph()
+    calc_para.add_run("Calculation:").bold = True
+    calc_para.add_run(
+        " each criterion is scored 0–5, multiplied by its importance; "
+        "total is normalized to 100. Technical and Contextual subtotals are "
+        "also independently normalized to 100."
+    )
+    doc.add_paragraph()
+
+    # Criteria table (4 cols, all plain)
+    table_lines = [l for l in criteria.split("\n") if "|" in l]
     criteria_rows = _parse_md_table("\n".join(table_lines))
     if criteria_rows:
-        _add_table_to_doc(doc, criteria_rows)
+        _add_criteria_table(doc, criteria_rows)
 
-    synthesis_text = rankings.get("synthesis", "")
-    sections = _parse_rankings(synthesis_text)
-    logging.info(f"Synthesis sections lengths: { {k: len(v) for k, v in sections.items()} }")
-
-    if sections[1]:
-        doc.add_paragraph(_strip_md(sections[1]))
-    if sections[2]:
-        doc.add_paragraph(_strip_md(sections[2]))
-
+    # H3: Recommendation
     doc.add_heading("Recommendation", level=3)
-    for line in sections[3].split("\n"):
-        s = line.strip()
-        if not s:
-            continue
-        if re.match(r"^[\*\-]\s", s):
-            content = _strip_md(re.sub(r"^[\*\-]\s+", "", s))
-            doc.add_paragraph(content, style="List Paragraph")
-        else:
-            doc.add_paragraph(_strip_md(s))
 
+    recommendation = sections.get("recommendation", "").strip()
+    if recommendation:
+        for para_text in recommendation.split("\n\n"):
+            para_text = para_text.strip()
+            if para_text:
+                _add_rich_paragraph(doc, para_text)
+
+    # References: bold label + List Paragraph per file
+    references = rankings.get("references", [])
+    if references:
+        ref_para = doc.add_paragraph()
+        ref_para.add_run("References:").bold = True
+        for ref in references:
+            doc.add_paragraph(ref, style="List Paragraph")
+
+    # Ranking table (7 cols, per-column bold)
     header_row = rankings.get("header_row")
     ranked_rows = rankings.get("ranked_rows", [])
-    if header_row and ranked_rows:
-        _add_table_to_doc(doc, [header_row] + ranked_rows)
-    elif ranked_rows:
-        _add_table_to_doc(doc, ranked_rows)
+    if ranked_rows:
+        _add_ranking_table(doc, header_row, ranked_rows)
 
     filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.docx")
     doc.save(filename)
@@ -540,9 +689,8 @@ def process_message(message_text, channel_id, thread_ts, client):
             _index_ready.wait(timeout=180)
 
         if _supplier_index and len(_supplier_index["docs"]) > 0:
-            # Vector retrieval: combine brief + criteria for best semantic match
-            query = f"{message_text}\n\n{criteria}"
-            supplier_docs = retrieve_top_k(query, k=TOP_K)
+            # Two-pass retrieval: narrow (message+criteria) + broad (criterion names)
+            supplier_docs = retrieve_two_pass(message_text, criteria, k=TOP_K)
         else:
             # Fallback: score all docs the slow way
             logging.warning("Vector index unavailable — falling back to full scan")
