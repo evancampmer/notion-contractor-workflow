@@ -122,22 +122,33 @@ def get_supplier_docs():
     """Download all DOCX files from the Google Drive folder and extract text."""
     supplier_docs = []
 
-    list_resp = drive_session.get(
-        "https://www.googleapis.com/drive/v3/files",
-        params={
+    # Paginate through all results — Drive API caps at 100 per page by default
+    files = []
+    page_token = None
+    while True:
+        params = {
             "q": (
                 f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
                 f"and mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' "
                 f"and trashed=false"
             ),
-            "fields": "files(id, name)",
+            "fields": "nextPageToken, files(id, name)",
+            "pageSize": 1000,
             "supportsAllDrives": "true",
             "includeItemsFromAllDrives": "true",
             "corpora": "allDrives",
         }
-    )
-    list_resp.raise_for_status()
-    files = list_resp.json().get("files", [])
+        if page_token:
+            params["pageToken"] = page_token
+        list_resp = drive_session.get(
+            "https://www.googleapis.com/drive/v3/files", params=params
+        )
+        list_resp.raise_for_status()
+        data = list_resp.json()
+        files.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
     logging.info(f"Found {len(files)} supplier docs in Drive")
 
     for file in files:
