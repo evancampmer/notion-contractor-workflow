@@ -78,9 +78,9 @@ Output exactly two things with NO extra text:
 Rules:
 - Category is "Technical" or "Contextual"
 - 4-7 criteria total — only the most critical ones
-- Use SHORT criterion names (2-4 words max, e.g. "GTM execution", "PMO cadence", "PE value creation")
+- Criterion names: 2-5 words, plain English, no abbreviations or underscores (e.g. "510(k) submission experience", "FDA regulatory strategy", "submission program leadership")
 - Importance: 1-5 (5 = must-have)
-- Evidence standard: specific words/phrases to look for in a profile
+- Evidence standard: a SHORT phrase describing what to look for, plain English (e.g. "Explicit 510(k) filing work", "Direct FDA device regulatory experience"). NOT a list of quoted keywords.
 - No commentary, no headers, no explanation outside these two items"""
 
 SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
@@ -90,15 +90,15 @@ Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited 
 Table columns (use exactly these headers):
 | Rank / Name | Total Score | Technical / Contextual Subtotals | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary | Overall Summary on Fit |
 
-Scoring rules:
+Column definitions — follow exactly:
 - Rank / Name: rank number + full name, e.g. "1. Jane Smith"
-- Total Score: integer 0-100 (weighted sum of all criteria scores normalized to 100)
-- Technical / Contextual Subtotals: each independently normalized to 100, format "X / Y" (Technical / Contextual)
-- Each Criterion Score: "short_name: N; short_name: N; ..." using the exact short criterion names from the criteria table, score 0-5 each
+- Total Score: a SINGLE integer 0-100. This is the overall weighted score normalized to 100. Example: "44". Never use a slash or fraction here.
+- Technical / Contextual Subtotals: TWO numbers separated by " / ", each independently normalized to 100. Example: "20 / 77". This column only appears AFTER Total Score.
+- Each Criterion Score (0-5): list each criterion by its plain-English name followed by its 0-5 score, e.g. "510(k) submission experience: 0; FDA regulatory strategy: 2; Medical device sector: 3". Use plain English names exactly as written in the criteria table — no abbreviations, no underscores.
 - Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
 - Strengths Summary: 1-2 sentences citing specific evidence; enclose 1-2 key phrases in **double asterisks**
-- Weakness Summary: 1-2 sentences on specific gaps, no formatting
-- Overall Summary on Fit: 1-2 sentences; first sentence must be a clear verdict (e.g. "Best available adjacent candidate, but not a verified X lead.")
+- Weakness Summary: 1-2 sentences on specific gaps, plain text
+- Overall Summary on Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but not a verified 510(k) lead.")
 - Score ALL suppliers; assign 0 on any criterion with no relevant evidence
 - Sort rows by Total Score descending"""
 
@@ -190,7 +190,7 @@ def _get_embed_model():
             if _embed_model is None:
                 from fastembed import TextEmbedding
                 logging.info("Loading fastembed model (BAAI/bge-small-en-v1.5)...")
-                _embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+                _embed_model = TextEmbedding("BAAI/bge-large-en-v1.5")
                 logging.info("Embedding model loaded")
     return _embed_model
 
@@ -440,11 +440,16 @@ def rank_suppliers(criteria, supplier_docs):
     top_rows = data_rows[:15]
     logging.info(f"Scored {len(data_rows)} candidates, kept top {len(top_rows)}")
 
-    # Build reference filenames from ranked candidate names
+    # Build references: clean display names for candidates with score > 0
+    # Fallback to top 3 if none scored above 0
+    scored = [r for r in top_rows if _extract_score(r) > 0]
+    ref_rows = scored[:5] if scored else top_rows[:3]
     references = []
-    for row in top_rows:
+    for row in ref_rows:
         name_raw = re.sub(r"^\d+\.\s*", "", row[0]).strip()
-        references.append(name_raw.replace(" ", "_") + ".docx")
+        # Clean up filename artifacts (e.g. "coming soon", underscores)
+        name_clean = re.sub(r"\s*(coming soon|tbd|pending)\s*", "", name_raw, flags=re.IGNORECASE).strip()
+        references.append(name_clean)
 
     synthesis = synthesize(criteria, top_rows)
     logging.info("Synthesis complete")
@@ -569,27 +574,30 @@ def _add_ranking_table(doc, header_row, data_rows):
 
 
 def _parse_synthesis(synthesis_text):
-    """Parse HEADLINE/OPENING/RECOMMENDATION sections from synthesis output."""
+    """Parse HEADLINE/OPENING/RECOMMENDATION sections from synthesis output.
+    Handles bold markers, markdown headers, and varied label formatting."""
     result = {"headline": "", "opening": "", "recommendation": ""}
     current = None
     lines = {"headline": [], "opening": [], "recommendation": []}
 
     for line in synthesis_text.split("\n"):
-        stripped = line.strip()
-        upper = stripped.upper()
-        if upper.startswith("HEADLINE:"):
+        # Strip markdown/bold markers for label detection only
+        clean = re.sub(r"[*#_]+", "", line).strip()
+        upper = clean.upper()
+
+        if re.match(r"^HEADLINE\s*:", upper):
             current = "headline"
-            rest = stripped[len("HEADLINE:"):].strip()
+            rest = re.sub(r"(?i)^headline\s*:\s*", "", clean).strip()
             if rest:
                 lines["headline"].append(rest)
-        elif upper.startswith("OPENING:"):
+        elif re.match(r"^OPENING\s*:", upper):
             current = "opening"
-            rest = stripped[len("OPENING:"):].strip()
+            rest = re.sub(r"(?i)^opening\s*:\s*", "", clean).strip()
             if rest:
                 lines["opening"].append(rest)
-        elif upper.startswith("RECOMMENDATION:"):
+        elif re.match(r"^RECOMMENDATION\s*:", upper):
             current = "recommendation"
-            rest = stripped[len("RECOMMENDATION:"):].strip()
+            rest = re.sub(r"(?i)^recommendation\s*:\s*", "", clean).strip()
             if rest:
                 lines["recommendation"].append(rest)
         elif current:
@@ -608,12 +616,13 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     sections = _parse_synthesis(synthesis_text)
     logging.info(f"Synthesis sections: { {k: len(v) for k, v in sections.items()} }")
 
-    # H2: headline from synthesis, fallback to original message
+    # H2: headline from synthesis, fallback to "Screening result: [message]"
     headline = sections.get("headline", "").strip()
     if not headline:
-        headline = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
-        if len(headline) > 80:
-            headline = headline[:77] + "..."
+        fallback = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
+        if len(fallback) > 70:
+            fallback = fallback[:67] + "..."
+        headline = f"Screening result: {fallback}"
     doc.add_heading(headline, level=2)
 
     # Opening paragraph with inline bold
@@ -780,6 +789,33 @@ def health():
     index_status = "ready" if (_supplier_index and len(_supplier_index["docs"]) > 0) else "loading"
     count = len(_supplier_index["docs"]) if _supplier_index else 0
     return {"status": "ok", "index": index_status, "profiles": count}, 200
+
+
+@flask_app.route("/index-check", methods=["GET"])
+def index_check():
+    """Diagnostic endpoint — shows index health and a sample of loaded profiles."""
+    if not _supplier_index or len(_supplier_index["docs"]) == 0:
+        return {
+            "status": "empty",
+            "profiles_loaded": 0,
+            "message": "Index is empty or still loading. Try again in 60-120 seconds."
+        }, 200
+
+    docs = _supplier_index["docs"]
+    vectors = _supplier_index["vectors"]
+
+    # Check vectors are non-zero
+    zero_count = int((np.linalg.norm(vectors, axis=1) < 0.01).sum())
+    sample = [d["name"] for d in docs[:10]]
+
+    return {
+        "status": "ok",
+        "profiles_loaded": len(docs),
+        "zero_vectors": zero_count,
+        "embedding_dimensions": int(vectors.shape[1]),
+        "sample_profiles": sample,
+        "message": "Index looks healthy." if zero_count == 0 else f"WARNING: {zero_count} profiles have zero vectors — embeddings may be corrupted."
+    }, 200
 
 
 @flask_app.route("/refresh-index", methods=["POST"])
