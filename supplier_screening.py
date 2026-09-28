@@ -45,7 +45,12 @@ openrouter = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY_ALINA")
 )
 
+openai_client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
 MODEL = "anthropic/claude-sonnet-4-5"
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 service_account_info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
@@ -189,21 +194,31 @@ REFRESH_SECRET = os.getenv("REFRESH_SECRET", "")
 _supplier_index = None   # {"docs": list, "vectors": np.ndarray}
 _index_lock = threading.Lock()
 _index_ready = threading.Event()
-_embed_model = None
-_embed_lock = threading.Lock()
 
 
-def _get_embed_model():
-    """Lazy-load the fastembed model (thread-safe)."""
-    global _embed_model
-    if _embed_model is None:
-        with _embed_lock:
-            if _embed_model is None:
-                from fastembed import TextEmbedding
-                logging.info("Loading fastembed model (BAAI/bge-small-en-v1.5)...")
-                _embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
-                logging.info("Embedding model loaded")
-    return _embed_model
+def _embed_texts(texts):
+    """Embed a list of texts using OpenAI's embedding API. Returns normalized np.ndarray."""
+    logging.info(f"Embedding {len(texts)} texts via OpenAI ({EMBEDDING_MODEL})...")
+    response = openai_client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts
+    )
+    vectors = np.array([d.embedding for d in response.data], dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    vectors = vectors / np.maximum(norms, 1e-10)
+    logging.info(f"Embeddings done: {vectors.shape}")
+    return vectors
+
+
+def _embed_query(text):
+    """Embed a single query string. Returns normalized 1D np.ndarray."""
+    response = openai_client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=[text]
+    )
+    vec = np.array(response.data[0].embedding, dtype=np.float32)
+    vec = vec / max(np.linalg.norm(vec), 1e-10)
+    return vec
 
 
 def _find_drive_file_id(filename):
@@ -247,16 +262,13 @@ def _load_embeddings_from_drive():
 
 
 def _build_index_from_scratch():
-    """Compute embeddings from Drive DOCXs. Fallback when no pre-computed JSON exists."""
+    """Compute embeddings from Drive DOCXs via OpenAI API. Fallback when no pre-computed JSON exists."""
     docs = get_supplier_docs()
     if not docs:
         return None
-    model = _get_embed_model()
     texts = [d["text"][:PROFILE_CHARS] for d in docs]
-    logging.info(f"Computing embeddings for {len(docs)} profiles (first-time setup)...")
-    vectors = np.array(list(model.embed(texts)), dtype=np.float32)
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    vectors = vectors / np.maximum(norms, 1e-10)
+    logging.info(f"Computing embeddings for {len(docs)} profiles via OpenAI (first-time setup)...")
+    vectors = _embed_texts(texts)
     logging.info(f"Embeddings computed for {len(docs)} profiles")
     return {"docs": docs, "vectors": vectors}
 
@@ -283,9 +295,7 @@ def _build_index():
 
 def retrieve_top_k(query_text, k=TOP_K):
     """Return the k most semantically similar supplier profiles to the query."""
-    model = _get_embed_model()
-    q_vec = np.array(list(model.embed([query_text]))[0], dtype=np.float32)
-    q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
+    q_vec = _embed_query(query_text)
 
     with _index_lock:
         index = _supplier_index
