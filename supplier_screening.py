@@ -201,7 +201,7 @@ def _get_embed_model():
             if _embed_model is None:
                 from fastembed import TextEmbedding
                 logging.info("Loading fastembed model (BAAI/bge-small-en-v1.5)...")
-                _embed_model = TextEmbedding("BAAI/bge-large-en-v1.5")
+                _embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
                 logging.info("Embedding model loaded")
     return _embed_model
 
