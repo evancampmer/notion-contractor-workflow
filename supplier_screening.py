@@ -61,6 +61,10 @@ drive_session = AuthorizedSession(credentials)
 
 SLACK_CHANNEL_ID = "C0C2QRTGAUV"
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+# Separate folder for supplier_embeddings.json — keeps it out of the contractors folder.
+# Create a Drive folder (e.g. "Supplier Index"), grab its ID, add as EMBEDDINGS_FOLDER_ID
+# in Railway. Falls back to the contractors folder if not set.
+EMBEDDINGS_FOLDER_ID = os.getenv("EMBEDDINGS_FOLDER_ID", GOOGLE_DRIVE_FOLDER_ID)
 OUTPUT_FOLDER = "output_docs"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -222,11 +226,11 @@ def _embed_query(text):
 
 
 def _find_drive_file_id(filename):
-    """Return the Drive file ID for a file in the supplier folder, or None."""
+    """Return the Drive file ID for a file in the embeddings folder, or None."""
     resp = drive_session.get(
         "https://www.googleapis.com/drive/v3/files",
         params={
-            "q": f"name='{filename}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false",
+            "q": f"name='{filename}' and '{EMBEDDINGS_FOLDER_ID}' in parents and trashed=false",
             "fields": "files(id)",
             "supportsAllDrives": "true",
             "includeItemsFromAllDrives": "true",
@@ -261,15 +265,57 @@ def _load_embeddings_from_drive():
         return None
 
 
+def _save_embeddings_to_drive(docs, vectors):
+    """Save computed embeddings to Drive as supplier_embeddings.json."""
+    try:
+        from datetime import timezone
+        profiles = [
+            {"name": docs[i]["name"], "text": docs[i]["text"], "vector": vectors[i].tolist()}
+            for i in range(len(docs))
+        ]
+        payload = json.dumps({
+            "version": datetime.now(timezone.utc).isoformat(),
+            "profiles": profiles
+        }).encode()
+
+        existing_id = _find_drive_file_id(EMBEDDINGS_FILENAME)
+        if existing_id:
+            drive_session.patch(
+                f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}",
+                headers={"Content-Type": "application/json"},
+                params={"uploadType": "media", "supportsAllDrives": "true"},
+                data=payload
+            )
+            logging.info(f"Updated {EMBEDDINGS_FILENAME} in Drive ({len(docs)} profiles)")
+        else:
+            boundary = "embedboundary"
+            meta = json.dumps({"name": EMBEDDINGS_FILENAME, "parents": [EMBEDDINGS_FOLDER_ID]})
+            body = (
+                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+                + meta +
+                f"\r\n--{boundary}\r\nContent-Type: application/json\r\n\r\n"
+            ).encode() + payload + f"\r\n--{boundary}--".encode()
+            drive_session.post(
+                "https://www.googleapis.com/upload/drive/v3/files",
+                headers={"Content-Type": f"multipart/related; boundary={boundary}"},
+                params={"uploadType": "multipart", "supportsAllDrives": "true"},
+                data=body
+            )
+            logging.info(f"Created {EMBEDDINGS_FILENAME} in Drive ({len(docs)} profiles)")
+    except Exception as e:
+        logging.error(f"Failed to save embeddings to Drive: {e}", exc_info=True)
+
+
 def _build_index_from_scratch():
-    """Compute embeddings from Drive DOCXs via OpenAI API. Fallback when no pre-computed JSON exists."""
+    """Compute embeddings from Drive DOCXs via OpenAI API, then save JSON to Drive."""
     docs = get_supplier_docs()
     if not docs:
         return None
     texts = [d["text"][:PROFILE_CHARS] for d in docs]
-    logging.info(f"Computing embeddings for {len(docs)} profiles via OpenAI (first-time setup)...")
+    logging.info(f"Computing embeddings for {len(docs)} profiles via OpenAI...")
     vectors = _embed_texts(texts)
-    logging.info(f"Embeddings computed for {len(docs)} profiles")
+    logging.info(f"Embeddings computed for {len(docs)} profiles — saving to Drive...")
+    _save_embeddings_to_drive(docs, vectors)
     return {"docs": docs, "vectors": vectors}
 
 
@@ -842,7 +888,8 @@ def index_check():
 @flask_app.route("/refresh-index", methods=["POST"])
 def refresh_index():
     """Called by the Notion pipeline after uploading new DOCXs.
-    Reloads the pre-computed embeddings JSON from Drive into memory.
+    Triggers a full rebuild: downloads all DOCXs, recomputes embeddings via OpenAI,
+    saves supplier_embeddings.json to Drive, and updates the in-memory index.
     Requires Authorization: Bearer <REFRESH_SECRET> header.
     """
     auth = request.headers.get("Authorization", "")
@@ -852,13 +899,14 @@ def refresh_index():
     def _refresh():
         global _supplier_index
         try:
-            index = _load_embeddings_from_drive()
+            logging.info("Index refresh triggered by Notion pipeline — rebuilding from scratch...")
+            index = _build_index_from_scratch()
             if index:
                 with _index_lock:
                     _supplier_index = index
-                logging.info(f"Index refreshed: {len(index['docs'])} profiles loaded from Drive")
+                logging.info(f"Index refreshed: {len(index['docs'])} profiles ready")
             else:
-                logging.warning("Refresh called but no embeddings file found in Drive")
+                logging.warning("Refresh: no docs found in Drive")
         except Exception as e:
             logging.error(f"Index refresh failed: {e}", exc_info=True)
 
