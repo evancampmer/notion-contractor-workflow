@@ -49,7 +49,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "z-ai/glm-5.3"
+MODEL = "anthropic/claude-sonnet-4-5"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -439,6 +439,15 @@ def _is_header_row(row):
 # AI CALLS
 # =========================
 
+def _get_content(response, label="LLM"):
+    """Extract content from an OpenRouter response, with a clear error if None."""
+    content = response.choices[0].message.content
+    if content is None:
+        reason = getattr(response.choices[0], "finish_reason", "unknown")
+        raise ValueError(f"{label} returned None content (finish_reason: {reason}). Model may not support this request format.")
+    return content
+
+
 def create_supplier_criteria(message_text):
     logging.info("Creating supplier criteria...")
     response = openrouter.chat.completions.create(
@@ -449,7 +458,7 @@ def create_supplier_criteria(message_text):
             {"role": "user", "content": f"Create the screening criteria for this project brief:\n\n{message_text}"}
         ]
     )
-    return response.choices[0].message.content
+    return _get_content(response, "Criteria")
 
 
 def score_suppliers(criteria, supplier_docs):
@@ -467,7 +476,7 @@ def score_suppliers(criteria, supplier_docs):
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
         ]
     )
-    return response.choices[0].message.content
+    return _get_content(response, "Scoring")
 
 
 def synthesize(criteria, top_rows):
@@ -486,7 +495,7 @@ def synthesize(criteria, top_rows):
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSCORED CANDIDATES (ranked):\n{candidate_summary}"}
         ]
     )
-    return response.choices[0].message.content
+    return _get_content(response, "Synthesis")
 
 
 def rank_suppliers(criteria, supplier_docs):
