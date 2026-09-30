@@ -49,7 +49,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "anthropic/claude-sonnet-4-5"
+MODEL = "z-ai/glm-5.3"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
