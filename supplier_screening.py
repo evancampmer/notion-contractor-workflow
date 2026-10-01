@@ -49,7 +49,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "z-ai/glm-5.3"
+MODEL = "anthropic/claude-sonnet-4-5"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -68,7 +68,7 @@ EMBEDDINGS_FOLDER_ID = os.getenv("EMBEDDINGS_FOLDER_ID", GOOGLE_DRIVE_FOLDER_ID)
 OUTPUT_FOLDER = "output_docs"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-TOP_K = 30          # profiles to retrieve per pass via vector search before scoring
+TOP_K = 20          # profiles to retrieve per pass via vector search before scoring
 PROFILE_CHARS = 3000  # max chars per profile sent to the scoring LLM
 
 # =========================
@@ -96,18 +96,19 @@ SCORING_PROMPT = """You are a supplier screening agent at a consulting and staff
 
 Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited table — no preamble, no commentary, no extra text.
 
-Table columns (use exactly these headers):
-| Rank / Name | Total Score | Technical / Contextual Subtotals | Each Criterion Score (0-5) | Strengths Summary | Weakness Summary | Overall Summary on Fit |
+Table columns (use exactly these 8 headers in this order):
+| Rank / Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0–5) | Strengths Summary | Weakness Summary | Overall Fit |
 
 Column definitions — follow exactly:
 - Rank / Name: rank number + full name, e.g. "1. Jane Smith"
-- Total Score: a SINGLE integer 0-100. This is the overall weighted score normalized to 100. Example: "44". Never use a slash or fraction here.
-- Technical / Contextual Subtotals: TWO numbers separated by " / ", each independently normalized to 100. Example: "20 / 77". This column only appears AFTER Total Score.
-- Each Criterion Score (0-5): list each criterion by its plain-English name followed by its 0-5 score, e.g. "510(k) submission experience: 0; FDA regulatory strategy: 2; Medical device sector: 3". Use plain English names exactly as written in the criteria table — no abbreviations, no underscores.
+- Total Score /100: a SINGLE integer 0-100. Calculated as (40% × Technical) + (60% × Contextual). Example: "62". Never use a slash or fraction here.
+- Technical /100: Technical criteria subtotal independently normalized to 100 based on importance-weighted scores. Use 0 if no technical criteria exist.
+- Contextual /100: Contextual criteria subtotal independently normalized to 100 based on importance-weighted scores. Use 0 if no contextual criteria exist.
+- Each Criterion Score (0–5): ALL criterion scores go in ONE single cell — do NOT create a separate column per criterion. Use SHORT criterion names (2-3 words max, abbreviate where needed). Format: "Short name score; Short name score; ...". Example: "GTM 5; Intelligence 4; CRM/data 3; PE/top-tier 5; PMO 4; Industrial 2; Embedded/comms 5". Every criterion must appear in this one cell.
 - Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
 - Strengths Summary: 1-2 sentences citing specific evidence; enclose 1-2 key phrases in **double asterisks**
 - Weakness Summary: 1-2 sentences on specific gaps, plain text
-- Overall Summary on Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but not a verified 510(k) lead.")
+- Overall Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but no verified 510(k) filing history.")
 - Score ALL suppliers; assign 0 on any criterion with no relevant evidence
 - Sort rows by Total Score descending"""
 
@@ -115,13 +116,16 @@ SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing a completed
 
 Write exactly three labeled sections. Use **double asterisks** around key terms inline where indicated. No other text outside these sections.
 
-HEADLINE: [One short noun phrase — the overall finding. Format: "Screening result: [specific finding]". Example: "Screening result: no verified 510(k) filing specialist identified"]
+HEADLINE: [The engagement title. Format: "Supplier screening results — [role / engagement description]". Example: "Supplier screening results — Embedded Commercial PMO / B2B Sales Pilot". Derive from the role or project described in the criteria. Do NOT use "Screening result: ..." format.]
 
-OPENING: [One paragraph. Describe what was screened and the key conclusion. Bold 2-4 key criteria names and the core conclusion phrase using **double asterisks**. Style: "I screened the supplier profiles for explicit evidence of **X**, **Y**, and **Z**. [Finding sentence with **bold conclusion**]."]
+SCORING METHOD: [1-2 paragraphs. Para 1: name the **technical criteria** (as bold) with their importance weights and the **contextual criteria** (as bold) with their importance weights — briefly describe what each group measures. Para 2: explain the 40/60 weighting — Technical subtotals count for 40% of Total Score, Contextual subtotals for 60%, normalized to 100. Explain briefly why this weighting fits the role. Keep it concise and professional — no bullet points.]
 
-RECOMMENDATION: [2 paragraphs separated by a blank line.
-Para 1: Overall action recommendation. Bold key candidate names and key roles or caveats with **double asterisks**.
-Para 2: What the ideal required profile should explicitly demonstrate. Bold 2-3 key requirements with **double asterisks**.]"""
+RECOMMENDATION: [3-5 short paragraphs. Be action-oriented and specific. Each paragraph starts with a clear action:
+- "Advance **[Name]** as the primary candidate. [1-2 sentences of specific evidence from their profile]."
+- "Advance **[Name]** as the leading alternative. [reason with specific evidence]."
+- "Use **[Name]** only if [condition]. [reason]."
+- End with a paragraph noting any systematic gap across the candidate pool, or what the ideal candidate would need to demonstrate that none currently show.
+Bold candidate names with **double asterisks**.]"""
 
 # =========================
 # GOOGLE DRIVE
@@ -470,7 +474,7 @@ def score_suppliers(criteria, supplier_docs):
     logging.info(f"Scoring {len(supplier_docs)} profiles in one call...")
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=6000,
+        max_tokens=8000,
         messages=[
             {"role": "system", "content": SCORING_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
@@ -480,11 +484,13 @@ def score_suppliers(criteria, supplier_docs):
 
 
 def synthesize(criteria, top_rows):
-    """Generate HEADLINE/OPENING/RECOMMENDATION from scored candidates."""
+    """Generate HEADLINE/SCORING METHOD/RECOMMENDATION from scored candidates."""
+    # 8-col table: Rank/Name | Total | Technical | Contextual | CriterionScores | Strengths | Weakness | Overall Fit
     candidate_summary = "\n".join(
-        f"{row[0]}: Total={row[1]}, Subtotals={row[2] if len(row) > 2 else 'N/A'}, "
-        f"Strengths: {row[4] if len(row) > 4 else 'N/A'}, "
-        f"Gaps: {row[5] if len(row) > 5 else 'N/A'}"
+        f"{row[0]}: Total={row[1]}, Technical={row[2] if len(row) > 2 else 'N/A'}, "
+        f"Contextual={row[3] if len(row) > 3 else 'N/A'}, "
+        f"Strengths: {row[5] if len(row) > 5 else 'N/A'}, "
+        f"Gaps: {row[6] if len(row) > 6 else 'N/A'}"
         for row in top_rows
     )
     response = openrouter.chat.completions.create(
@@ -610,10 +616,11 @@ def _add_criteria_table(doc, rows):
 
 
 def _add_ranking_table(doc, header_row, data_rows):
-    """Add the 7-column ranking table with Cassidy-style per-column bold formatting."""
+    """Add the 8-column ranking table matching Cassidy format:
+    Rank/Name | Total /100 | Technical /100 | Contextual /100 | Criterion Scores | Strengths | Weakness | Overall Fit"""
     if not data_rows:
         return
-    num_cols = 7
+    num_cols = 8
     all_rows = ([header_row] if header_row else []) + data_rows
     table = doc.add_table(rows=len(all_rows), cols=num_cols)
     table.style = "Table Grid"
@@ -628,33 +635,34 @@ def _add_ranking_table(doc, header_row, data_rows):
             if is_header:
                 cell.text = cell_text  # header: plain text
             else:
-                if c_idx in (0, 1, 2):
-                    # Rank/Name, Total Score, Subtotals: entire content bold
+                if c_idx in (0, 1, 2, 3):
+                    # Rank/Name, Total Score, Technical, Contextual: entire content bold
                     cell.text = ""
                     run = cell.paragraphs[0].add_run(cell_text)
                     run.bold = True
-                elif c_idx == 3:
-                    # Criterion scores: bold just the numbers
-                    _bold_criterion_numbers(cell, cell_text)
                 elif c_idx == 4:
-                    # Strengths: **markers** from LLM
-                    _set_cell_rich(cell, cell_text)
+                    # Criterion scores (short names): bold just the numbers
+                    _bold_criterion_numbers(cell, cell_text)
                 elif c_idx == 5:
-                    # Weakness: plain
-                    cell.text = cell_text
+                    # Strengths Summary: **markers** from LLM
+                    _set_cell_rich(cell, cell_text)
                 elif c_idx == 6:
-                    # Overall Summary on Fit: first sentence bold
+                    # Weakness Summary: plain text
+                    cell.text = cell_text
+                elif c_idx == 7:
+                    # Overall Fit: first sentence bold
                     _bold_first_sentence(cell, cell_text)
 
     doc.add_paragraph()
 
 
 def _parse_synthesis(synthesis_text):
-    """Parse HEADLINE/OPENING/RECOMMENDATION sections from synthesis output.
+    """Parse HEADLINE/SCORING METHOD/RECOMMENDATION sections from synthesis output.
+    Also accepts OPENING as a backward-compatible alias for SCORING METHOD.
     Handles bold markers, markdown headers, and varied label formatting."""
-    result = {"headline": "", "opening": "", "recommendation": ""}
+    result = {"headline": "", "scoring_method": "", "recommendation": ""}
     current = None
-    lines = {"headline": [], "opening": [], "recommendation": []}
+    lines = {"headline": [], "scoring_method": [], "recommendation": []}
 
     for line in synthesis_text.split("\n"):
         # Strip markdown/bold markers for label detection only
@@ -666,11 +674,17 @@ def _parse_synthesis(synthesis_text):
             rest = re.sub(r"(?i)^headline\s*:\s*", "", clean).strip()
             if rest:
                 lines["headline"].append(rest)
+        elif re.match(r"^SCORING\s+METHOD\s*:", upper):
+            current = "scoring_method"
+            rest = re.sub(r"(?i)^scoring\s+method\s*:\s*", "", clean).strip()
+            if rest:
+                lines["scoring_method"].append(rest)
         elif re.match(r"^OPENING\s*:", upper):
-            current = "opening"
+            # backward-compat alias for SCORING METHOD
+            current = "scoring_method"
             rest = re.sub(r"(?i)^opening\s*:\s*", "", clean).strip()
             if rest:
-                lines["opening"].append(rest)
+                lines["scoring_method"].append(rest)
         elif re.match(r"^RECOMMENDATION\s*:", upper):
             current = "recommendation"
             rest = re.sub(r"(?i)^recommendation\s*:\s*", "", clean).strip()
@@ -680,7 +694,7 @@ def _parse_synthesis(synthesis_text):
             lines[current].append(line)
 
     result["headline"] = "\n".join(lines["headline"]).strip()
-    result["opening"] = "\n".join(lines["opening"]).strip()
+    result["scoring_method"] = "\n".join(lines["scoring_method"]).strip()
     result["recommendation"] = "\n".join(lines["recommendation"]).strip()
     return result
 
@@ -692,39 +706,35 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     sections = _parse_synthesis(synthesis_text)
     logging.info(f"Synthesis sections: { {k: len(v) for k, v in sections.items()} }")
 
-    # H2: headline from synthesis, fallback to "Screening result: [message]"
+    # H2: headline from synthesis — "Supplier screening results — [engagement title]"
     headline = sections.get("headline", "").strip()
     if not headline:
         fallback = next((l.strip() for l in original_message.split("\n") if l.strip()), "Supplier Screening")
         if len(fallback) > 70:
             fallback = fallback[:67] + "..."
-        headline = f"Screening result: {fallback}"
+        headline = f"Supplier screening results — {fallback}"
     doc.add_heading(headline, level=2)
 
-    # Opening paragraph with inline bold
-    opening = sections.get("opening", "").strip()
-    if opening:
-        _add_rich_paragraph(doc, opening)
+    # H3: Scoring method
+    doc.add_heading("Scoring method", level=3)
 
-    # H3: Scoring criteria and weights
-    doc.add_heading("Scoring criteria and weights", level=3)
+    # Scoring method narrative (from synthesis) with inline bold
+    scoring_method = sections.get("scoring_method", "").strip()
+    if scoring_method:
+        for para_text in scoring_method.split("\n\n"):
+            para_text = para_text.strip()
+            if para_text:
+                _add_rich_paragraph(doc, para_text)
+    else:
+        # Fallback: generic scoring method description
+        calc_para = doc.add_paragraph()
+        calc_para.add_run("Calculation:").bold = True
+        calc_para.add_run(
+            " each criterion is scored 0–5, multiplied by its importance; "
+            "Technical subtotal (40%) and Contextual subtotal (60%) are each "
+            "independently normalized to 100, then combined for the Total Score."
+        )
     doc.add_paragraph()
-
-    # Calculation line: "Calculation:" bold + rest plain
-    calc_para = doc.add_paragraph()
-    calc_para.add_run("Calculation:").bold = True
-    calc_para.add_run(
-        " each criterion is scored 0–5, multiplied by its importance; "
-        "total is normalized to 100. Technical and Contextual subtotals are "
-        "also independently normalized to 100."
-    )
-    doc.add_paragraph()
-
-    # Criteria table (4 cols, all plain)
-    table_lines = [l for l in criteria.split("\n") if "|" in l]
-    criteria_rows = _parse_md_table("\n".join(table_lines))
-    if criteria_rows:
-        _add_criteria_table(doc, criteria_rows)
 
     # H3: Recommendation
     doc.add_heading("Recommendation", level=3)
@@ -744,7 +754,7 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         for ref in references:
             doc.add_paragraph(ref, style="List Paragraph")
 
-    # Ranking table (7 cols, per-column bold)
+    # Ranking table (8 cols, per-column bold)
     header_row = rankings.get("header_row")
     ranked_rows = rankings.get("ranked_rows", [])
     if ranked_rows:
