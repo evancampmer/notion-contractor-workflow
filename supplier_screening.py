@@ -16,7 +16,10 @@ from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
 from openai import OpenAI
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt, RGBColor, Inches
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 
@@ -615,15 +618,64 @@ def _add_criteria_table(doc, rows):
     doc.add_paragraph()
 
 
+def _cell_set_shading(cell, fill_hex):
+    """Set cell background color (fill_hex without #, e.g. 'F5B7B1')."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for existing in tcPr.findall(qn('w:shd')):
+        tcPr.remove(existing)
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex)
+    tcPr.append(shd)
+
+
+def _cell_set_width(cell, twips):
+    """Set cell width in twips (1440 twips = 1 inch)."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for existing in tcPr.findall(qn('w:tcW')):
+        tcPr.remove(existing)
+    tcW = OxmlElement('w:tcW')
+    tcW.set(qn('w:w'), str(twips))
+    tcW.set(qn('w:type'), 'dxa')
+    tcPr.append(tcW)
+
+
+def _run_font_size(run, pt):
+    """Set font size on a run."""
+    run.font.size = Pt(pt)
+
+
 def _add_ranking_table(doc, header_row, data_rows):
     """Add the 8-column ranking table matching Cassidy format:
-    Rank/Name | Total /100 | Technical /100 | Contextual /100 | Criterion Scores | Strengths | Weakness | Overall Fit"""
+    Rank/Name | Total /100 | Technical /100 | Contextual /100 | Criterion Scores | Strengths | Weakness | Overall Fit
+
+    Column widths are fixed so names never collapse. Header row has the
+    Cassidy rose/salmon background. Score columns are right-aligned.
+    All cells use 9pt to keep everything readable at this column count."""
     if not data_rows:
         return
+
+    # Fixed column widths in twips (1440 = 1 inch). Total = 9360 = 6.5 inches.
+    # Rank/Name  Total  Tech   Ctx    CritScore  Strengths  Weakness  Overall
+    COL_W = [1584,   792,   792,   864,   1656,      1440,      1224,     1008]
+    HEADER_COLOR = "F5B7B1"   # Cassidy rose/salmon
+    FONT_PT = 9
+    # Columns whose content should be right-aligned (score numbers)
+    RIGHT_ALIGN = {1, 2, 3}
+
     num_cols = 8
     all_rows = ([header_row] if header_row else []) + data_rows
     table = doc.add_table(rows=len(all_rows), cols=num_cols)
     table.style = "Table Grid"
+
+    # Lock the table to fixed layout so Word respects explicit widths
+    tblPr = table._tbl.tblPr
+    tblLayout = OxmlElement('w:tblLayout')
+    tblLayout.set(qn('w:type'), 'fixed')
+    tblPr.append(tblLayout)
 
     for r_idx, row in enumerate(all_rows):
         row = list(row) + [""] * (num_cols - len(row))
@@ -632,26 +684,49 @@ def _add_ranking_table(doc, header_row, data_rows):
 
         for c_idx, cell_text in enumerate(row):
             cell = table.cell(r_idx, c_idx)
+            _cell_set_width(cell, COL_W[c_idx])
+
             if is_header:
-                cell.text = cell_text  # header: plain text
+                _cell_set_shading(cell, HEADER_COLOR)
+                cell.text = ""
+                run = cell.paragraphs[0].add_run(cell_text)
+                run.bold = True
+                _run_font_size(run, FONT_PT)
             else:
-                if c_idx in (0, 1, 2, 3):
-                    # Rank/Name, Total Score, Technical, Contextual: entire content bold
+                if c_idx == 0:
+                    # Rank / Name: bold
                     cell.text = ""
                     run = cell.paragraphs[0].add_run(cell_text)
                     run.bold = True
+                    _run_font_size(run, FONT_PT)
+                elif c_idx in (1, 2, 3):
+                    # Score columns: bold + right-aligned
+                    cell.text = ""
+                    para = cell.paragraphs[0]
+                    para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    run = para.add_run(cell_text)
+                    run.bold = True
+                    _run_font_size(run, FONT_PT)
                 elif c_idx == 4:
-                    # Criterion scores (short names): bold just the numbers
+                    # Criterion scores: bold just the numbers
                     _bold_criterion_numbers(cell, cell_text)
+                    for run in cell.paragraphs[0].runs:
+                        _run_font_size(run, FONT_PT)
                 elif c_idx == 5:
-                    # Strengths Summary: **markers** from LLM
+                    # Strengths: **markers** from LLM
                     _set_cell_rich(cell, cell_text)
+                    for run in cell.paragraphs[0].runs:
+                        _run_font_size(run, FONT_PT)
                 elif c_idx == 6:
-                    # Weakness Summary: plain text
+                    # Weakness: plain
                     cell.text = cell_text
+                    for run in cell.paragraphs[0].runs:
+                        _run_font_size(run, FONT_PT)
                 elif c_idx == 7:
                     # Overall Fit: first sentence bold
                     _bold_first_sentence(cell, cell_text)
+                    for run in cell.paragraphs[0].runs:
+                        _run_font_size(run, FONT_PT)
 
     doc.add_paragraph()
 
@@ -699,6 +774,14 @@ def _parse_synthesis(synthesis_text):
     return result
 
 
+def _heading_red(doc, text, level):
+    """Add a heading with Cassidy red color (matches the rose header row)."""
+    heading = doc.add_heading(text, level=level)
+    for run in heading.runs:
+        run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)  # dark red, matches Cassidy
+    return heading
+
+
 def generate_recommendations_docx(criteria, rankings, original_message):
     doc = Document()
 
@@ -714,10 +797,10 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         if len(fallback) > 70:
             fallback = fallback[:67] + "..."
         headline = f"Supplier screening results — {fallback}"
-    doc.add_heading(headline, level=2)
+    _heading_red(doc, headline, level=2)
 
     # H3: Scoring method
-    doc.add_heading("Scoring method", level=3)
+    _heading_red(doc, "Scoring method", level=3)
 
     # Scoring method narrative (from synthesis) with inline bold
     scoring_method = sections.get("scoring_method", "").strip()
@@ -738,7 +821,7 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     doc.add_paragraph()
 
     # H3: Recommendation
-    doc.add_heading("Recommendation", level=3)
+    _heading_red(doc, "Recommendation", level=3)
 
     recommendation = sections.get("recommendation", "").strip()
     if recommendation:
