@@ -118,13 +118,13 @@ Write exactly three labeled sections. Use **double asterisks** around key terms 
 
 HEADLINE: [The engagement title. Format: "Supplier screening results — [role / engagement description]". Example: "Supplier screening results — Embedded Commercial PMO / B2B Sales Pilot". Derive from the role or project described in the criteria. Do NOT use "Screening result: ..." format.]
 
-SCORING METHOD: [1-2 paragraphs. Para 1: name the **technical criteria** (as bold) with their importance weights and the **contextual criteria** (as bold) with their importance weights — briefly describe what each group measures. Para 2: explain the 40/60 weighting — Technical subtotals count for 40% of Total Score, Contextual subtotals for 60%, normalized to 100. Explain briefly why this weighting fits the role. Keep it concise and professional — no bullet points.]
+OPENING: [1-2 paragraphs. Para 1: name each **technical criterion** (as bold) with its importance weight and each **contextual criterion** (as bold) with its importance weight — briefly describe what each group measures. Para 2: explain the 40/60 weighting — Technical subtotals count for 40% of Total Score, Contextual subtotals for 60%, normalized to 100. Explain briefly why this weighting fits the role. No bullet points.]
 
-RECOMMENDATION: [3-5 short paragraphs. Be action-oriented and specific. Each paragraph starts with a clear action:
+RECOMMENDATION: [3-5 short paragraphs. Be action-oriented. Each paragraph starts with a clear action:
 - "Advance **[Name]** as the primary candidate. [1-2 sentences of specific evidence from their profile]."
 - "Advance **[Name]** as the leading alternative. [reason with specific evidence]."
 - "Use **[Name]** only if [condition]. [reason]."
-- End with a paragraph noting any systematic gap across the candidate pool, or what the ideal candidate would need to demonstrate that none currently show.
+- End with a paragraph noting any systematic gap across the pool, or what the ideal candidate would need to show that none currently demonstrate.
 Bold candidate names with **double asterisks**.]"""
 
 # =========================
@@ -703,8 +703,9 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     doc = Document()
 
     synthesis_text = rankings.get("synthesis", "")
+    logging.info(f"Raw synthesis output:\n{synthesis_text[:2000]}")
     sections = _parse_synthesis(synthesis_text)
-    logging.info(f"Synthesis sections: { {k: len(v) for k, v in sections.items()} }")
+    logging.info(f"Synthesis sections parsed: { {k: len(v) for k, v in sections.items()} }")
 
     # H2: headline from synthesis — "Supplier screening results — [engagement title]"
     headline = sections.get("headline", "").strip()
@@ -744,7 +745,7 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         for para_text in recommendation.split("\n\n"):
             para_text = para_text.strip()
             if para_text:
-                _add_rich_paragraph(doc, para_text)
+                _add_rich_paragraph(doc, para_text, style="List Paragraph")
 
     # References: bold label + List Paragraph per file
     references = rankings.get("references", [])
