@@ -52,7 +52,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "deepseek/deepseek-chat"
+MODEL = "anthropic/claude-sonnet-4-5"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -184,7 +184,8 @@ def get_supplier_docs():
 
             supplier_docs.append({
                 "name": file["name"].replace(".docx", "").replace("_", " "),
-                "text": text
+                "text": text,
+                "file_id": file["id"]
             })
 
             os.unlink(tmp_path)
@@ -263,7 +264,7 @@ def _load_embeddings_from_drive():
         profiles = data.get("profiles", [])
         if not profiles:
             return None
-        docs = [{"name": p["name"], "text": p["text"]} for p in profiles]
+        docs = [{"name": p["name"], "text": p["text"], "file_id": p.get("file_id", "")} for p in profiles]
         vectors = np.array([p["vector"] for p in profiles], dtype=np.float32)
         logging.info(f"Loaded {len(docs)} pre-computed embeddings from Drive (version {data.get('version', 'unknown')})")
         return {"docs": docs, "vectors": vectors}
@@ -277,7 +278,7 @@ def _save_embeddings_to_drive(docs, vectors):
     try:
         from datetime import timezone
         profiles = [
-            {"name": docs[i]["name"], "text": docs[i]["text"], "vector": vectors[i].tolist()}
+            {"name": docs[i]["name"], "text": docs[i]["text"], "file_id": docs[i].get("file_id", ""), "vector": vectors[i].tolist()}
             for i in range(len(docs))
         ]
         payload = json.dumps({
@@ -844,6 +845,19 @@ def generate_recommendations_docx(criteria, rankings, original_message):
     if ranked_rows:
         _add_ranking_table(doc, header_row, ranked_rows)
 
+    # All Contractors section — everyone in the database not already in the ranked table
+    remaining_contractors = rankings.get("remaining_contractors", [])
+    if remaining_contractors:
+        doc.add_paragraph()
+        _heading_red(doc, "All Contractors in Database", level=3)
+        intro = doc.add_paragraph()
+        intro.add_run(
+            "The following contractors are in the database but were not included in the ranked results above."
+        ).italic = True
+        doc.add_paragraph()
+        for contractor in remaining_contractors:
+            doc.add_paragraph(contractor["name"], style="List Paragraph")
+
     filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.docx")
     doc.save(filename)
     return filename
@@ -884,6 +898,25 @@ def process_message(message_text, channel_id, thread_ts, client):
 
         rankings = rank_suppliers(criteria, supplier_docs)
         logging.info("Rankings complete")
+
+        # Compute which contractors were NOT in the ranked output
+        ranked_names = set()
+        for row in rankings.get("ranked_rows", []):
+            name_raw = re.sub(r"^\d+\.\s*", "", row[0]).strip()
+            ranked_names.add(name_raw.lower())
+
+        remaining_contractors = []
+        if _supplier_index:
+            for doc_entry in _supplier_index["docs"]:
+                name = doc_entry["name"]
+                if name.lower() not in ranked_names:
+                    remaining_contractors.append({
+                        "name": name,
+                        "file_id": doc_entry.get("file_id", "")
+                    })
+            remaining_contractors.sort(key=lambda x: x["name"])
+        rankings["remaining_contractors"] = remaining_contractors
+        logging.info(f"Remaining contractors (not ranked): {len(remaining_contractors)}")
 
         docx_path = generate_recommendations_docx(criteria, rankings, message_text)
 
