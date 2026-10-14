@@ -52,7 +52,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "qwen/qwen3.7-plus"
+MODEL = "deepseek/deepseek-chat"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -460,8 +460,7 @@ def create_supplier_criteria(message_text):
     logging.info("Creating supplier criteria...")
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=4000,
-        extra_body={"thinking": {"type": "disabled"}},
+        max_tokens=2000,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
             {"role": "user", "content": f"Create the screening criteria for this project brief:\n\n{message_text}"}
@@ -480,7 +479,6 @@ def score_suppliers(criteria, supplier_docs):
     response = openrouter.chat.completions.create(
         model=MODEL,
         max_tokens=8000,
-        extra_body={"thinking": {"type": "disabled"}},
         messages=[
             {"role": "system", "content": SCORING_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSUPPLIER PROFILES:\n{supplier_text}"}
@@ -501,8 +499,7 @@ def synthesize(criteria, top_rows):
     )
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=8000,
-        extra_body={"thinking": {"type": "disabled"}},
+        max_tokens=4000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSCORED CANDIDATES (ranked):\n{candidate_summary}"}
