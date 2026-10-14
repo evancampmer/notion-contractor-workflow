@@ -52,7 +52,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "qwen/qwen3.8-max-prime"
+MODEL = "qwen/qwen3.7-plus"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -499,7 +499,7 @@ def synthesize(criteria, top_rows):
     )
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=4000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSCORED CANDIDATES (ranked):\n{candidate_summary}"}
