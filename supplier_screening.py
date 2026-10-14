@@ -460,7 +460,7 @@ def create_supplier_criteria(message_text):
     logging.info("Creating supplier criteria...")
     response = openrouter.chat.completions.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=4000,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
             {"role": "user", "content": f"Create the screening criteria for this project brief:\n\n{message_text}"}
