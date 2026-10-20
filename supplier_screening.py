@@ -52,7 +52,9 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "deepseek/deepseek-chat"
+MODEL = "deepseek/deepseek-chat"                 # batch scoring — high volume, cost-sensitive
+CRITERIA_MODEL = "anthropic/claude-sonnet-4-5"  # criteria extraction — single call, sets the whole frame
+SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-5" # synthesis & recommendation — narrative quality matters
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -114,6 +116,7 @@ Column definitions — follow exactly:
 - Overall Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but no verified 510(k) filing history.")
 - Score ALL suppliers; assign 0 on any criterion with no relevant evidence
 - CRITICAL: Every supplier gets their OWN individual row. NEVER group multiple suppliers into one row. NEVER write "All others", "Remaining candidates", or any combined entry. If a profile is empty or has no evidence, still give it its own row with all 0 scores.
+- Before returning, count your output rows and verify the count matches the number of SUPPLIER profiles you were given. If any are missing, add them before finishing.
 - Sort rows by Total Score descending"""
 
 SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing a completed supplier screen.
@@ -462,9 +465,9 @@ def _get_content(response, label="LLM"):
 
 
 def create_supplier_criteria(message_text):
-    logging.info("Creating supplier criteria...")
+    logging.info(f"Creating supplier criteria using {CRITERIA_MODEL}...")
     response = openrouter.chat.completions.create(
-        model=MODEL,
+        model=CRITERIA_MODEL,
         max_tokens=2000,
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
@@ -503,7 +506,7 @@ def synthesize(criteria, top_rows):
         for row in top_rows
     )
     response = openrouter.chat.completions.create(
-        model=MODEL,
+        model=SYNTHESIS_MODEL,
         max_tokens=4000,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
@@ -516,7 +519,7 @@ def synthesize(criteria, top_rows):
 def rank_suppliers(criteria, supplier_docs):
     """Score ALL docs in batches of 25, combine, sort, synthesize.
     Every profile gets a row in the output — no cap on ranked results."""
-    BATCH_SIZE = 25
+    BATCH_SIZE = 15
     all_data_rows = []
     header_row = None
 
