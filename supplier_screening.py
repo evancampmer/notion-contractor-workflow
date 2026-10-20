@@ -52,7 +52,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "anthropic/claude-sonnet-4-5"
+MODEL = "deepseek/deepseek-chat"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -123,10 +123,10 @@ HEADLINE: [The engagement title. Format: "Supplier screening results — [role /
 
 OPENING: [1-2 paragraphs. Para 1: name each **technical criterion** (as bold) with its importance weight and each **contextual criterion** (as bold) with its importance weight — briefly describe what each group measures. Para 2: explain the 40/60 weighting — Technical subtotals count for 40% of Total Score, Contextual subtotals for 60%, normalized to 100. Explain briefly why this weighting fits the role. No bullet points.]
 
-RECOMMENDATION: [3-5 short paragraphs. Be action-oriented. Each paragraph starts with a clear action:
-- "Advance **[Name]** as the primary candidate. [1-2 sentences of specific evidence from their profile]."
-- "Advance **[Name]** as the leading alternative. [reason with specific evidence]."
-- "Use **[Name]** only if [condition]. [reason]."
+RECOMMENDATION: [3-5 short paragraphs. Be action-oriented. Use the EXACT candidate names from the scored candidates list provided — do NOT use placeholders like "Candidate A" or "Candidate B". Each paragraph starts with a clear action:
+- "Advance **[exact name from scored list]** as the primary candidate. [1-2 sentences of specific evidence from their profile]."
+- "Advance **[exact name from scored list]** as the leading alternative. [reason with specific evidence]."
+- "Use **[exact name from scored list]** only if [condition]. [reason]."
 - End with a paragraph noting any systematic gap across the pool, or what the ideal candidate would need to show that none currently demonstrate.
 Bold candidate names with **double asterisks**.]"""
 
@@ -509,41 +509,55 @@ def synthesize(criteria, top_rows):
 
 
 def rank_suppliers(criteria, supplier_docs):
-    """Full pipeline: score docs, sort, synthesize, return structured result."""
-    raw = score_suppliers(criteria, supplier_docs)
-    rows = _parse_md_table(raw)
-
+    """Score ALL docs in batches of 25, combine, sort, synthesize.
+    Every profile gets a row in the output — no cap on ranked results."""
+    BATCH_SIZE = 25
+    all_data_rows = []
     header_row = None
-    data_rows = []
-    for row in rows:
-        if _is_header_row(row):
-            if header_row is None:
-                header_row = row
-        else:
-            data_rows.append(row)
 
-    data_rows.sort(key=_extract_score, reverse=True)
-    top_rows = data_rows[:15]
-    logging.info(f"Scored {len(data_rows)} candidates, kept top {len(top_rows)}")
+    total_batches = (len(supplier_docs) + BATCH_SIZE - 1) // BATCH_SIZE
+    for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1):
+        batch = supplier_docs[i:i + BATCH_SIZE]
+        logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles)...")
+        raw = score_suppliers(criteria, batch)
+        logging.info(f"Batch {batch_num} raw output (first 300 chars):\n{raw[:300]}")
+        rows = _parse_md_table(raw)
+        for row in rows:
+            if _is_header_row(row):
+                if header_row is None:
+                    header_row = row
+            else:
+                all_data_rows.append(row)
 
-    # Build references: clean display names for candidates with score > 0
-    # Fallback to top 3 if none scored above 0
-    scored = [r for r in top_rows if _extract_score(r) > 0]
-    ref_rows = scored[:5] if scored else top_rows[:3]
+    # Sort all rows across all batches by score descending
+    all_data_rows.sort(key=_extract_score, reverse=True)
+
+    # Re-number ranks after combining batches
+    for idx, row in enumerate(all_data_rows):
+        name_clean = re.sub(r"^\d+\.\s*", "", row[0]).strip()
+        row[0] = f"{idx + 1}. {name_clean}"
+
+    logging.info(f"Scored {len(all_data_rows)} candidates across {total_batches} batches")
+
+    # Synthesis only uses top scored candidates — not all 150
+    scored = [r for r in all_data_rows if _extract_score(r) > 0]
+    top_for_synthesis = scored[:15]
+
+    # References: top 5 with score > 0
+    ref_rows = scored[:5] if scored else all_data_rows[:3]
     references = []
     for row in ref_rows:
         name_raw = re.sub(r"^\d+\.\s*", "", row[0]).strip()
-        # Clean up filename artifacts (e.g. "coming soon", underscores)
         name_clean = re.sub(r"\s*(coming soon|tbd|pending)\s*", "", name_raw, flags=re.IGNORECASE).strip()
         references.append(name_clean)
 
-    synthesis = synthesize(criteria, top_rows)
+    synthesis = synthesize(criteria, top_for_synthesis)
     logging.info("Synthesis complete")
 
     return {
         "synthesis": synthesis,
         "header_row": header_row,
-        "ranked_rows": top_rows,
+        "ranked_rows": all_data_rows,   # all profiles, not just top 15
         "references": references
     }
 
@@ -839,24 +853,44 @@ def generate_recommendations_docx(criteria, rankings, original_message):
         for ref in references:
             doc.add_paragraph(ref, style="List Paragraph")
 
-    # Ranking table (8 cols, per-column bold)
+    # Split all ranked rows into three tiers (mirrors Cassidy output structure):
+    #   Tier 1 — Priority shortlist: top 15 with score > 0
+    #   Tier 2 — Remaining substantive profiles: everyone else with score > 0
+    #   Tier 3 — No usable evidence: score == 0
     header_row = rankings.get("header_row")
     ranked_rows = rankings.get("ranked_rows", [])
-    if ranked_rows:
-        _add_ranking_table(doc, header_row, ranked_rows)
 
-    # All Contractors section — everyone in the database not already in the ranked table
-    remaining_contractors = rankings.get("remaining_contractors", [])
-    if remaining_contractors:
+    scored_rows = [r for r in ranked_rows if _extract_score(r) > 0]
+    zero_rows   = [r for r in ranked_rows if _extract_score(r) == 0]
+    tier1_rows  = scored_rows[:15]
+    tier2_rows  = scored_rows[15:]
+
+    if tier1_rows:
         doc.add_paragraph()
-        _heading_red(doc, "All Contractors in Database", level=3)
+        _heading_red(doc, "Priority Shortlist", level=3)
         intro = doc.add_paragraph()
         intro.add_run(
-            "The following contractors are in the database but were not included in the ranked results above."
+            f"The following {len(tier1_rows)} contractor(s) ranked highest against the screening criteria."
         ).italic = True
+        _add_ranking_table(doc, header_row, tier1_rows)
+
+    if tier2_rows:
         doc.add_paragraph()
-        for contractor in remaining_contractors:
-            doc.add_paragraph(contractor["name"], style="List Paragraph")
+        _heading_red(doc, "Remaining Substantive Profiles — Ranked", level=3)
+        intro = doc.add_paragraph()
+        intro.add_run(
+            f"The following {len(tier2_rows)} contractor(s) showed some relevant evidence but scored outside the top shortlist."
+        ).italic = True
+        _add_ranking_table(doc, header_row, tier2_rows)
+
+    if zero_rows:
+        doc.add_paragraph()
+        _heading_red(doc, "Profiles with No Usable Criterion Evidence", level=3)
+        intro = doc.add_paragraph()
+        intro.add_run(
+            f"The following {len(zero_rows)} contractor(s) had no usable evidence against the screening criteria and scored 0."
+        ).italic = True
+        _add_ranking_table(doc, header_row, zero_rows)
 
     filename = os.path.join(OUTPUT_FOLDER, "Supplier_Recommendations.docx")
     doc.save(filename)
@@ -881,11 +915,11 @@ def process_message(message_text, channel_id, thread_ts, client):
             )
             _index_ready.wait(timeout=180)
 
+        # Score ALL profiles — everyone gets a ranked position
         if _supplier_index and len(_supplier_index["docs"]) > 0:
-            # Two-pass retrieval: narrow (message+criteria) + broad (criterion names)
-            supplier_docs = retrieve_two_pass(message_text, criteria, k=TOP_K)
+            supplier_docs = list(_supplier_index["docs"])
+            logging.info(f"Scoring all {len(supplier_docs)} profiles from index")
         else:
-            # Fallback: score all docs the slow way
             logging.warning("Vector index unavailable — falling back to full scan")
             supplier_docs = get_supplier_docs()
 
@@ -896,27 +930,14 @@ def process_message(message_text, channel_id, thread_ts, client):
             )
             return
 
+        total_batches = (len(supplier_docs) + 24) // 25
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts,
+            text=f"Scoring all {len(supplier_docs)} contractor profiles across {total_batches} batches — this will take a few minutes. ⏳"
+        )
+
         rankings = rank_suppliers(criteria, supplier_docs)
         logging.info("Rankings complete")
-
-        # Compute which contractors were NOT in the ranked output
-        ranked_names = set()
-        for row in rankings.get("ranked_rows", []):
-            name_raw = re.sub(r"^\d+\.\s*", "", row[0]).strip()
-            ranked_names.add(name_raw.lower())
-
-        remaining_contractors = []
-        if _supplier_index:
-            for doc_entry in _supplier_index["docs"]:
-                name = doc_entry["name"]
-                if name.lower() not in ranked_names:
-                    remaining_contractors.append({
-                        "name": name,
-                        "file_id": doc_entry.get("file_id", "")
-                    })
-            remaining_contractors.sort(key=lambda x: x["name"])
-        rankings["remaining_contractors"] = remaining_contractors
-        logging.info(f"Remaining contractors (not ranked): {len(remaining_contractors)}")
 
         docx_path = generate_recommendations_docx(criteria, rankings, message_text)
 
