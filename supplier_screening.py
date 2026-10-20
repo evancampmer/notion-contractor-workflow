@@ -113,6 +113,7 @@ Column definitions — follow exactly:
 - Weakness Summary: 1-2 sentences on specific gaps, plain text
 - Overall Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but no verified 510(k) filing history.")
 - Score ALL suppliers; assign 0 on any criterion with no relevant evidence
+- CRITICAL: Every supplier gets their OWN individual row. NEVER group multiple suppliers into one row. NEVER write "All others", "Remaining candidates", or any combined entry. If a profile is empty or has no evidence, still give it its own row with all 0 scores.
 - Sort rows by Total Score descending"""
 
 SYNTHESIS_PROMPT = """You are a supplier screening agent summarizing a completed supplier screen.
@@ -532,6 +533,21 @@ def rank_suppliers(criteria, supplier_docs):
                     header_row = row
             else:
                 all_data_rows.append(row)
+
+    # Reconciliation: find any input profiles the model dropped or grouped,
+    # and add them as 0-score rows so every person appears in the output.
+    scored_names_lower = set()
+    for row in all_data_rows:
+        name_clean = re.sub(r"^\d+\.\s*", "", row[0]).strip().lower()
+        scored_names_lower.add(name_clean)
+
+    n_cols = len(header_row) if header_row else 8
+    for doc in supplier_docs:
+        doc_name = doc["name"].strip()
+        if doc_name.lower() not in scored_names_lower:
+            logging.warning(f"Missing from scoring output — adding as 0: {doc_name}")
+            zero_row = [doc_name, "0", "0", "0"] + ["N/A"] * (n_cols - 4)
+            all_data_rows.append(zero_row)
 
     # Sort all rows across all batches by score descending
     all_data_rows.sort(key=_extract_score, reverse=True)
