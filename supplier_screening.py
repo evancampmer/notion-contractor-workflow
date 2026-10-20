@@ -418,12 +418,16 @@ def _strip_md(text):
 
 
 def _parse_md_table(text):
-    """Extract rows from a markdown pipe-delimited table."""
+    """Extract rows from a markdown pipe-delimited table.
+    Handles: code fences, preamble text, trailing commentary."""
+    # Strip markdown code fences (```markdown, ```table, ``` etc.)
+    text = re.sub(r"```[^\n]*\n?", "", text)
     rows = []
     for line in text.split("\n"):
         line = line.strip()
         if not line.startswith("|"):
             continue
+        # Skip separator rows (e.g. |---|---|)
         if re.match(r"^\|[-|:\s]+\|$", line):
             continue
         cells = [_strip_md(c.strip()) for c in line.strip("|").split("|")]
@@ -520,7 +524,7 @@ def rank_suppliers(criteria, supplier_docs):
         batch = supplier_docs[i:i + BATCH_SIZE]
         logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles)...")
         raw = score_suppliers(criteria, batch)
-        logging.info(f"Batch {batch_num} raw output (first 300 chars):\n{raw[:300]}")
+        logging.info(f"Batch {batch_num} raw output (first 1000 chars):\n{raw[:1000]}")
         rows = _parse_md_table(raw)
         for row in rows:
             if _is_header_row(row):
@@ -551,8 +555,18 @@ def rank_suppliers(criteria, supplier_docs):
         name_clean = re.sub(r"\s*(coming soon|tbd|pending)\s*", "", name_raw, flags=re.IGNORECASE).strip()
         references.append(name_clean)
 
-    synthesis = synthesize(criteria, top_for_synthesis)
-    logging.info("Synthesis complete")
+    if top_for_synthesis:
+        synthesis = synthesize(criteria, top_for_synthesis)
+        logging.info("Synthesis complete")
+    else:
+        logging.warning("No scored candidates — skipping synthesis")
+        synthesis = (
+            "HEADLINE: Supplier screening results — No matches found\n\n"
+            "OPENING: Scoring completed but no candidates received a score above 0 against the provided criteria. "
+            "This typically means the database does not contain profiles with explicit evidence for these requirements.\n\n"
+            "RECOMMENDATION: No candidates could be recommended based on the current database. "
+            "Consider broadening the criteria or adding relevant contractor profiles."
+        )
 
     return {
         "synthesis": synthesis,
