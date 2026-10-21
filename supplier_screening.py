@@ -106,6 +106,10 @@ Contextual criteria should be AS IMPORTANT as technical ones.
 ADJACENT — Complementary skills that would make someone even stronger given the context.
 - What additional background would elevate a candidate beyond the core requirements?
 
+Industry abbreviations — expand these when writing criteria and evidence standards:
+- MBB = McKinsey, Bain, or Boston Consulting Group (BCG)
+- Big 4 = Deloitte, PwC, Ernst & Young (EY), or KPMG
+
 Rules:
 - 6-9 criteria total across all three categories
 - Criterion names: 2-5 words, plain English (e.g. "Insurance sector experience", "Startup operating experience", "Executive stakeholder management")
@@ -114,6 +118,11 @@ Rules:
 - No commentary, no headers, no explanation outside these two items"""
 
 SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
+
+INDUSTRY ABBREVIATIONS — treat these as equivalent when scoring profiles:
+- MBB = McKinsey, Bain, or Boston Consulting Group (BCG). A profile mentioning any of these firms counts as MBB experience.
+- Big 4 = Deloitte, PwC, Ernst & Young (EY), or KPMG. A profile mentioning any of these firms counts as Big 4 experience.
+- If a criterion references "MBB" or "Big 4" background, score positively for any of the specific firms listed above.
 
 Score EVERY supplier profile against ALL criteria (Technical, Contextual, and Adjacent). Search each profile for explicit text that matches the criteria — not assumptions or inferences, only words and experiences that are directly stated in the profile.
 
