@@ -486,12 +486,15 @@ def create_supplier_criteria(message_text):
     response = openrouter.chat.completions.create(
         model=CRITERIA_MODEL,
         max_tokens=2000,
+        temperature=0,   # deterministic — same brief always produces same criteria
         messages=[
             {"role": "system", "content": CRITERIA_SYSTEM_PROMPT},
             {"role": "user", "content": f"Create the screening criteria for this project brief:\n\n{message_text}"}
         ]
     )
-    return _get_content(response, "Criteria")
+    criteria_text = _get_content(response, "Criteria")
+    logging.info(f"Criteria output:\n{criteria_text}")
+    return criteria_text
 
 
 def score_suppliers(criteria, supplier_docs):
@@ -525,12 +528,15 @@ def synthesize(criteria, top_rows):
     response = openrouter.chat.completions.create(
         model=SYNTHESIS_MODEL,
         max_tokens=4000,
+        temperature=0,
         messages=[
             {"role": "system", "content": SYNTHESIS_PROMPT},
             {"role": "user", "content": f"CRITERIA:\n{criteria}\n\nSCORED CANDIDATES (ranked):\n{candidate_summary}"}
         ]
     )
-    return _get_content(response, "Synthesis")
+    result = _get_content(response, "Synthesis")
+    logging.info(f"Raw synthesis output:\n{result}")
+    return result
 
 
 def rank_suppliers(criteria, supplier_docs):
@@ -817,39 +823,37 @@ def _add_ranking_table(doc, header_row, data_rows):
 
 
 def _parse_synthesis(synthesis_text):
-    """Parse HEADLINE/SCORING METHOD/RECOMMENDATION sections from synthesis output.
-    Also accepts OPENING as a backward-compatible alias for SCORING METHOD.
-    Handles bold markers, markdown headers, and varied label formatting."""
+    """Parse HEADLINE/OPENING/RECOMMENDATION sections from synthesis output.
+    Handles bold markers, markdown headers, varied label formatting, and
+    labels that appear without a colon (e.g. '**RECOMMENDATION**' on its own line)."""
     result = {"headline": "", "scoring_method": "", "recommendation": ""}
     current = None
     lines = {"headline": [], "scoring_method": [], "recommendation": []}
 
-    for line in synthesis_text.split("\n"):
-        # Strip markdown/bold markers for label detection only
-        clean = re.sub(r"[*#_]+", "", line).strip()
-        upper = clean.upper()
+    # Section label patterns — all aliases that map to each section
+    HEADLINE_RE   = re.compile(r"^HEADLINE\b", re.I)
+    OPENING_RE    = re.compile(r"^(OPENING|SCORING\s+METHOD)\b", re.I)
+    REC_RE        = re.compile(r"^RECOMMENDATION\b", re.I)
 
-        if re.match(r"^HEADLINE\s*:", upper):
-            current = "headline"
-            rest = re.sub(r"(?i)^headline\s*:\s*", "", clean).strip()
+    for line in synthesis_text.split("\n"):
+        # Strip markdown/bold/header markers for label detection only
+        clean = re.sub(r"[*#_`]+", "", line).strip()
+
+        # Detect section label — with or without a trailing colon
+        label_match = None
+        if HEADLINE_RE.match(clean):
+            label_match = "headline"
+        elif OPENING_RE.match(clean):
+            label_match = "scoring_method"
+        elif REC_RE.match(clean):
+            label_match = "recommendation"
+
+        if label_match:
+            current = label_match
+            # Grab any inline content after the label (e.g. "HEADLINE: Foo bar")
+            rest = re.sub(r"^[A-Z\s]+:?\s*", "", clean).strip()
             if rest:
-                lines["headline"].append(rest)
-        elif re.match(r"^SCORING\s+METHOD\s*:", upper):
-            current = "scoring_method"
-            rest = re.sub(r"(?i)^scoring\s+method\s*:\s*", "", clean).strip()
-            if rest:
-                lines["scoring_method"].append(rest)
-        elif re.match(r"^OPENING\s*:", upper):
-            # backward-compat alias for SCORING METHOD
-            current = "scoring_method"
-            rest = re.sub(r"(?i)^opening\s*:\s*", "", clean).strip()
-            if rest:
-                lines["scoring_method"].append(rest)
-        elif re.match(r"^RECOMMENDATION\s*:", upper):
-            current = "recommendation"
-            rest = re.sub(r"(?i)^recommendation\s*:\s*", "", clean).strip()
-            if rest:
-                lines["recommendation"].append(rest)
+                lines[current].append(rest)
         elif current:
             lines[current].append(line)
 
