@@ -534,20 +534,40 @@ def synthesize(criteria, top_rows):
 
 
 def rank_suppliers(criteria, supplier_docs):
-    """Score ALL docs in batches of 25, combine, sort, synthesize.
+    """Score ALL docs in parallel batches, combine, sort, synthesize.
     Every profile gets a row in the output — no cap on ranked results."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     BATCH_SIZE = 15
+    MAX_WORKERS = 5   # concurrent DeepSeek calls — stays within rate limits
+
+    batches = [
+        (batch_num, supplier_docs[i:i + BATCH_SIZE])
+        for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1)
+    ]
+    total_batches = len(batches)
+    logging.info(f"Scoring {len(supplier_docs)} profiles in {total_batches} parallel batches (workers={MAX_WORKERS})...")
+
+    batch_results = {}   # batch_num -> list of parsed rows
+
+    def _score_batch(batch_num, batch):
+        logging.info(f"Batch {batch_num}/{total_batches} started ({len(batch)} profiles)...")
+        raw = score_suppliers(criteria, batch)
+        logging.info(f"Batch {batch_num} raw output (first 500 chars):\n{raw[:500]}")
+        rows = _parse_md_table(raw)
+        return batch_num, rows
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_score_batch, bn, b): bn for bn, b in batches}
+        for future in as_completed(futures):
+            batch_num, rows = future.result()
+            batch_results[batch_num] = rows
+            logging.info(f"Batch {batch_num} complete — {len(rows)} rows parsed")
+
     all_data_rows = []
     header_row = None
-
-    total_batches = (len(supplier_docs) + BATCH_SIZE - 1) // BATCH_SIZE
-    for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1):
-        batch = supplier_docs[i:i + BATCH_SIZE]
-        logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles)...")
-        raw = score_suppliers(criteria, batch)
-        logging.info(f"Batch {batch_num} raw output (first 1000 chars):\n{raw[:1000]}")
-        rows = _parse_md_table(raw)
-        for row in rows:
+    for batch_num in sorted(batch_results):
+        for row in batch_results[batch_num]:
             if _is_header_row(row):
                 if header_row is None:
                     header_row = row
@@ -980,10 +1000,9 @@ def process_message(message_text, channel_id, thread_ts, client):
             )
             return
 
-        total_batches = (len(supplier_docs) + 24) // 25
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts,
-            text=f"Scoring all {len(supplier_docs)} contractor profiles across {total_batches} batches — this will take a few minutes. ⏳"
+            text=f"Scoring all {len(supplier_docs)} contractor profiles in parallel — should be ready in 2-3 minutes. ⏳"
         )
 
         rankings = rank_suppliers(criteria, supplier_docs)
