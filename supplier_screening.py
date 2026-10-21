@@ -52,9 +52,10 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "deepseek/deepseek-chat"                 # batch scoring — high volume, cost-sensitive
-CRITERIA_MODEL = "anthropic/claude-sonnet-4-5"  # criteria extraction — single call, sets the whole frame
-SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-5" # synthesis & recommendation — narrative quality matters
+MODEL = "deepseek/deepseek-chat"                      # batch scoring — high volume, cost-sensitive
+FALLBACK_MODEL = "anthropic/claude-haiku-4-5"         # fallback when DeepSeek shared pool is rate-limited
+CRITERIA_MODEL = "anthropic/claude-sonnet-4-5"        # criteria extraction — single call, sets the whole frame
+SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-5"       # synthesis & recommendation — narrative quality matters
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -497,15 +498,17 @@ def create_supplier_criteria(message_text):
     return criteria_text
 
 
-def score_suppliers(criteria, supplier_docs):
+def score_suppliers(criteria, supplier_docs, model=None):
     """Score the pre-filtered supplier docs in a single LLM call."""
+    if model is None:
+        model = MODEL
     supplier_text = "\n\n---\n\n".join(
         f"SUPPLIER: {doc['name']}\n\n{doc['text'][:PROFILE_CHARS]}"
         for doc in supplier_docs
     )
-    logging.info(f"Scoring {len(supplier_docs)} profiles in one call...")
+    logging.info(f"Scoring {len(supplier_docs)} profiles using {model}...")
     response = openrouter.chat.completions.create(
-        model=MODEL,
+        model=model,
         max_tokens=8000,
         messages=[
             {"role": "system", "content": SCORING_PROMPT},
@@ -545,17 +548,18 @@ def rank_suppliers(criteria, supplier_docs):
     BATCH_SIZE = 25
     all_data_rows = []
     header_row = None
+    active_model = MODEL   # may switch to FALLBACK_MODEL after persistent 429s
 
     total_batches = (len(supplier_docs) + BATCH_SIZE - 1) // BATCH_SIZE
     logging.info(f"Scoring {len(supplier_docs)} profiles across {total_batches} sequential batches...")
 
     for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1):
         batch = supplier_docs[i:i + BATCH_SIZE]
-        logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles)...")
+        logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles) with {active_model}...")
 
-        for attempt in range(1, 4):   # up to 3 attempts per batch
+        for attempt in range(1, 5):   # up to 4 attempts per batch
             try:
-                raw = score_suppliers(criteria, batch)
+                raw = score_suppliers(criteria, batch, model=active_model)
                 logging.info(f"Batch {batch_num} raw output (first 500 chars):\n{raw[:500]}")
                 rows = _parse_md_table(raw)
                 for row in rows:
@@ -566,10 +570,19 @@ def rank_suppliers(criteria, supplier_docs):
                         all_data_rows.append(row)
                 break  # success — move to next batch
             except Exception as e:
-                if "429" in str(e) and attempt < 3:
-                    wait = 20 * attempt   # 20s, then 40s
-                    logging.warning(f"Batch {batch_num} rate-limited — retrying in {wait}s (attempt {attempt}/3)")
-                    time.sleep(wait)
+                if "429" in str(e) and attempt < 4:
+                    if attempt >= 2 and active_model == MODEL:
+                        # Two 429s on DeepSeek — shared pool is saturated; switch to fallback for rest of run
+                        logging.warning(
+                            f"DeepSeek rate-limited {attempt} times on batch {batch_num} — "
+                            f"switching to fallback model {FALLBACK_MODEL} for remaining batches"
+                        )
+                        active_model = FALLBACK_MODEL
+                        time.sleep(5)   # brief pause before retry with new model
+                    else:
+                        wait = 30 * attempt   # 30s, then 60s before considering a model switch
+                        logging.warning(f"Batch {batch_num} rate-limited — retrying in {wait}s (attempt {attempt}/4)")
+                        time.sleep(wait)
                 else:
                     raise
 
