@@ -545,7 +545,7 @@ def rank_suppliers(criteria, supplier_docs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     BATCH_SIZE = 15
-    MAX_WORKERS = 5   # concurrent DeepSeek calls — stays within rate limits
+    MAX_WORKERS = 3   # concurrent DeepSeek calls — 5 caused 429s on shared pool
 
     batches = [
         (batch_num, supplier_docs[i:i + BATCH_SIZE])
@@ -558,10 +558,20 @@ def rank_suppliers(criteria, supplier_docs):
 
     def _score_batch(batch_num, batch):
         logging.info(f"Batch {batch_num}/{total_batches} started ({len(batch)} profiles)...")
-        raw = score_suppliers(criteria, batch)
-        logging.info(f"Batch {batch_num} raw output (first 500 chars):\n{raw[:500]}")
-        rows = _parse_md_table(raw)
-        return batch_num, rows
+        for attempt in range(1, 4):   # up to 3 attempts
+            try:
+                raw = score_suppliers(criteria, batch)
+                logging.info(f"Batch {batch_num} raw output (first 500 chars):\n{raw[:500]}")
+                rows = _parse_md_table(raw)
+                return batch_num, rows
+            except Exception as e:
+                if "429" in str(e) and attempt < 3:
+                    wait = 15 * attempt   # 15s, then 30s
+                    logging.warning(f"Batch {batch_num} rate-limited — retrying in {wait}s (attempt {attempt}/3)")
+                    time.sleep(wait)
+                else:
+                    raise
+        return batch_num, []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_score_batch, bn, b): bn for bn, b in batches}
