@@ -540,55 +540,38 @@ def synthesize(criteria, top_rows):
 
 
 def rank_suppliers(criteria, supplier_docs):
-    """Score ALL docs in parallel batches, combine, sort, synthesize.
+    """Score ALL docs in sequential batches, combine, sort, synthesize.
     Every profile gets a row in the output — no cap on ranked results."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    BATCH_SIZE = 25
+    all_data_rows = []
+    header_row = None
 
-    BATCH_SIZE = 15
-    MAX_WORKERS = 3   # concurrent DeepSeek calls — 5 caused 429s on shared pool
+    total_batches = (len(supplier_docs) + BATCH_SIZE - 1) // BATCH_SIZE
+    logging.info(f"Scoring {len(supplier_docs)} profiles across {total_batches} sequential batches...")
 
-    batches = [
-        (batch_num, supplier_docs[i:i + BATCH_SIZE])
-        for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1)
-    ]
-    total_batches = len(batches)
-    logging.info(f"Scoring {len(supplier_docs)} profiles in {total_batches} parallel batches (workers={MAX_WORKERS})...")
+    for batch_num, i in enumerate(range(0, len(supplier_docs), BATCH_SIZE), 1):
+        batch = supplier_docs[i:i + BATCH_SIZE]
+        logging.info(f"Scoring batch {batch_num}/{total_batches} ({len(batch)} profiles)...")
 
-    batch_results = {}   # batch_num -> list of parsed rows
-
-    def _score_batch(batch_num, batch):
-        logging.info(f"Batch {batch_num}/{total_batches} started ({len(batch)} profiles)...")
-        for attempt in range(1, 4):   # up to 3 attempts
+        for attempt in range(1, 4):   # up to 3 attempts per batch
             try:
                 raw = score_suppliers(criteria, batch)
                 logging.info(f"Batch {batch_num} raw output (first 500 chars):\n{raw[:500]}")
                 rows = _parse_md_table(raw)
-                return batch_num, rows
+                for row in rows:
+                    if _is_header_row(row):
+                        if header_row is None:
+                            header_row = row
+                    else:
+                        all_data_rows.append(row)
+                break  # success — move to next batch
             except Exception as e:
                 if "429" in str(e) and attempt < 3:
-                    wait = 15 * attempt   # 15s, then 30s
+                    wait = 20 * attempt   # 20s, then 40s
                     logging.warning(f"Batch {batch_num} rate-limited — retrying in {wait}s (attempt {attempt}/3)")
                     time.sleep(wait)
                 else:
                     raise
-        return batch_num, []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_score_batch, bn, b): bn for bn, b in batches}
-        for future in as_completed(futures):
-            batch_num, rows = future.result()
-            batch_results[batch_num] = rows
-            logging.info(f"Batch {batch_num} complete — {len(rows)} rows parsed")
-
-    all_data_rows = []
-    header_row = None
-    for batch_num in sorted(batch_results):
-        for row in batch_results[batch_num]:
-            if _is_header_row(row):
-                if header_row is None:
-                    header_row = row
-            else:
-                all_data_rows.append(row)
 
     # Reconciliation: find any input profiles the model dropped or grouped,
     # and add them as 0-score rows so every person appears in the output.
@@ -1016,7 +999,7 @@ def process_message(message_text, channel_id, thread_ts, client):
 
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts,
-            text=f"Scoring all {len(supplier_docs)} contractor profiles in parallel — should be ready in 2-3 minutes. ⏳"
+            text=f"Scoring all {len(supplier_docs)} contractor profiles — this takes around 7-8 minutes. ⏳"
         )
 
         rankings = rank_suppliers(criteria, supplier_docs)
