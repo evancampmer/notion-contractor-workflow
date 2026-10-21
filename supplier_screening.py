@@ -82,38 +82,55 @@ PROFILE_CHARS = 3000  # max chars per profile sent to the scoring LLM
 
 CRITERIA_SYSTEM_PROMPT = """You are a business analyst at a consulting and staffing firm. Convert a project description into a focused screening rubric.
 
+All components of the input — whether a short sentence or a long transcript — are integral to the criteria. Extract criteria that are stated explicitly AND those that are implied by the wording, context, or type of engagement described.
+
 Output exactly two things with NO extra text:
 
-1. A 1-2 sentence project summary.
+1. A 1-3 sentence project summary.
 
-2. A pipe-delimited criteria table:
+2. A pipe-delimited criteria table covering ALL THREE categories below:
 | Category | Criterion | Importance | Evidence standard |
 
+Categories and what to extract from each:
+
+TECHNICAL — Skills, credentials, or experiences explicitly mentioned or directly implied.
+- What specific expertise, tools, or qualifications does the role require?
+
+CONTEXTUAL — Fit criteria derived by reading between the lines of the description.
+- Company type/stage: What does the environment (startup, Fortune 500, innovation team, etc.) tell you about what's needed day-to-day?
+- Industry domain: Does industry or client background matter? (e.g. insurance, healthcare, fintech — include if experience in that world would meaningfully differentiate candidates)
+- Implicit work style: What does this role actually demand? (e.g. comfort with ambiguity, entrepreneurial mindset, executive presence)
+Contextual criteria should be AS IMPORTANT as technical ones.
+
+ADJACENT — Complementary skills that would make someone even stronger given the context.
+- What additional background would elevate a candidate beyond the core requirements?
+
 Rules:
-- Category is "Technical" or "Contextual"
-- 4-7 criteria total — only the most critical ones
-- Criterion names: 2-5 words, plain English, no abbreviations or underscores (e.g. "510(k) submission experience", "FDA regulatory strategy", "submission program leadership")
+- 6-9 criteria total across all three categories
+- Criterion names: 2-5 words, plain English (e.g. "Insurance sector experience", "Startup operating experience", "Executive stakeholder management")
 - Importance: 1-5 (5 = must-have)
-- Evidence standard: a SHORT phrase describing what to look for, plain English (e.g. "Explicit 510(k) filing work", "Direct FDA device regulatory experience"). NOT a list of quoted keywords.
+- Evidence standard: a SHORT phrase describing what explicit text to look for in a profile. NOT assumptions — only verifiable evidence.
 - No commentary, no headers, no explanation outside these two items"""
 
 SCORING_PROMPT = """You are a supplier screening agent at a consulting and staffing firm.
 
-Score EVERY supplier profile against the criteria. Return ONLY a pipe-delimited table — no preamble, no commentary, no extra text.
+Score EVERY supplier profile against ALL criteria (Technical, Contextual, and Adjacent). Search each profile for explicit text that matches the criteria — not assumptions or inferences, only words and experiences that are directly stated in the profile.
+
+Return ONLY a pipe-delimited table — no preamble, no commentary, no extra text.
 
 Table columns (use exactly these 8 headers in this order):
 | Rank / Name | Total Score /100 | Technical /100 | Contextual /100 | Each Criterion Score (0–5) | Strengths Summary | Weakness Summary | Overall Fit |
 
 Column definitions — follow exactly:
 - Rank / Name: rank number + full name, e.g. "1. Jane Smith"
-- Total Score /100: a SINGLE integer 0-100. Calculated as (40% × Technical) + (60% × Contextual). Example: "62". Never use a slash or fraction here.
+- Total Score /100: a SINGLE integer 0-100. Calculated as (40% × Technical) + (60% × Contextual). Adjacent criteria scores contribute to whichever subtotal is most relevant. Example: "62". Never use a slash or fraction here.
 - Technical /100: Technical criteria subtotal independently normalized to 100 based on importance-weighted scores. Use 0 if no technical criteria exist.
 - Contextual /100: Contextual criteria subtotal independently normalized to 100 based on importance-weighted scores. Use 0 if no contextual criteria exist.
-- Each Criterion Score (0–5): ALL criterion scores go in ONE single cell — do NOT create a separate column per criterion. Use SHORT criterion names (2-3 words max, abbreviate where needed). Format: "Short name score; Short name score; ...". Example: "GTM 5; Intelligence 4; CRM/data 3; PE/top-tier 5; PMO 4; Industrial 2; Embedded/comms 5". Every criterion must appear in this one cell.
-- Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions
-- Strengths Summary: 1-2 sentences citing specific evidence; enclose 1-2 key phrases in **double asterisks**
+- Each Criterion Score (0–5): ALL criterion scores (Technical + Contextual + Adjacent) go in ONE single cell. Use SHORT criterion names (2-3 words max). Format: "Short name score; Short name score; ...". Every criterion must appear.
+- Score each criterion 0-5 based ONLY on explicit text evidence in the profile — no assumptions. If the evidence is not directly stated, score 0.
+- Strengths Summary: 1-2 sentences citing specific evidence from the profile; enclose 1-2 key phrases in **double asterisks**
 - Weakness Summary: 1-2 sentences on specific gaps, plain text
-- Overall Fit: 1-2 sentences; first sentence is a clear plain-English verdict (e.g. "Best available adjacent candidate, but no verified 510(k) filing history.")
+- Overall Fit: 1-2 sentences; first sentence is a clear plain-English verdict
 - Score ALL suppliers; assign 0 on any criterion with no relevant evidence
 - CRITICAL: Every supplier gets their OWN individual row. NEVER group multiple suppliers into one row. NEVER write "All others", "Remaining candidates", or any combined entry. If a profile is empty or has no evidence, still give it its own row with all 0 scores.
 - Before returning, count your output rows and verify the count matches the number of SUPPLIER profiles you were given. If any are missing, add them before finishing.
