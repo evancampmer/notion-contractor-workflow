@@ -52,7 +52,7 @@ openai_client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-MODEL = "deepseek/deepseek-chat"                      # batch scoring — high volume, cost-sensitive
+MODEL = "deepseek/deepseek-v4.1-flash-1017"            # batch scoring — high volume, cost-sensitive
 FALLBACK_MODEL = "anthropic/claude-haiku-4-5"         # fallback when DeepSeek shared pool is rate-limited
 CRITERIA_MODEL = "anthropic/claude-sonnet-4-5"        # criteria extraction — single call, sets the whole frame
 SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-5"       # synthesis & recommendation — narrative quality matters
